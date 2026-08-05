@@ -1,10 +1,11 @@
 # impala_fdw specification
 
-**Status:** Draft v0.3 (binding intent for implementation)  
+**Status:** Draft v0.4 (binding intent for implementation)  
 **Storage scope:** Kudu-backed Impala tables only  
 **Implementation language:** **C/C++** (PostgreSQL FDW + libkudu_client + HS2 thrift client)—no Java runtime in the extension process  
 **Tenancy:** **Single-tenant / governance-plane** (no multi-tenant isolation inside the FDW)  
 **Identity:** **End-to-end Kerberos** — Postgres GSSAPI session user ↔ same principal for Impala/Kudu when possible  
+**Realm:** **`{ENV}.{LOCATION}.ZNDX.ORG`** (e.g. `DEV.VISTA.ZNDX.ORG`); PG role = principal **primary** only (`signals@DEV.…` → `signals`)  
 **Consumers:** signals-360 Postgres (AGE / Atlas graph co-location, Ranger policy helpers, sigint sampling)
 
 ## 1. Purpose
@@ -35,7 +36,7 @@ PostgreSQL (:5455)
 | G2 | Prefer Impala HS2 for general SQL-shaped queries (joins, complex predicates, partner demos) |
 | G3 | Recognize governance/sigint scan shapes and run them on a **Kudu fast path** when safe |
 | G4 | Single extension, single type-mapping layer, dual executors |
-| G5 | Align with signals devenv: PG 16 :5455, Impala HS2 :21050, Kudu masters :7051, realm `VISTA.ZNDX.ORG` |
+| G5 | Align with signals devenv: PG 16 :5455, Impala HS2 :21050, Kudu masters :7051, realm `DEV.VISTA.ZNDX.ORG` |
 | G6 | Kudu storage only—no Iceberg / HDFS / other Impala formats in v1 |
 | G7 | **C/C++ only** for extension code and remote clients (PGXS, libkudu_client, HS2 thrift/C++) |
 | G8 | **Kerberos as a first-class identity path** for Impala HS2 and Kudu (aligned with signals KDC), even if rollout is phased |
@@ -88,7 +89,7 @@ CREATE SERVER impala_kudu
     auth 'kerberos',         -- kerberos | nosasl (devenv convenience)
     krb_service 'impala',    -- HS2 service principal name component
     krb_host 'tinybox.dev.vista.zndx.org',
-    krb_realm 'VISTA.ZNDX.ORG',
+    krb_realm 'DEV.VISTA.ZNDX.ORG',
     kudu_masters '127.0.0.1:7051',
     default_access 'auto'    -- auto | impala_sql | kudu_scan
   );
@@ -101,7 +102,7 @@ CREATE SERVER impala_kudu
 | `auth` | no | `nosasl` in devenv docs; **design for `kerberos`** | See §11 |
 | `krb_service` | if kerberos | `impala` | Builds `impala/krb_host@REALM` |
 | `krb_host` | if kerberos | `SIGNALS_KRB_HOST` / `tinybox.dev.vista.zndx.org` | SPN instance |
-| `krb_realm` | if kerberos | `VISTA.ZNDX.ORG` | Must match signals KDC |
+| `krb_realm` | if kerberos | `DEV.VISTA.ZNDX.ORG` | Must match signals KDC |
 | `kudu_masters` | no | `127.0.0.1:7051` | Comma-separated; used by `kudu_scan` path |
 | `default_access` | no | `auto` | Force path for debugging |
 
@@ -110,7 +111,7 @@ CREATE SERVER impala_kudu
 ```sql
 CREATE USER MAPPING FOR CURRENT_USER SERVER impala_kudu
   OPTIONS (
-    principal 'signals@VISTA.ZNDX.ORG',   -- optional override
+    principal 'signals@DEV.VISTA.ZNDX.ORG',   -- optional override
     keytab '/path/to/signals.keytab'      -- or rely on process ticket cache
   );
 ```
@@ -222,7 +223,7 @@ Server `default_access` applies when table option is `auto`.
 
 1. Build remote SQL from foreign scan: projection + pushed quals + LIMIT if safe.
 2. Open HS2 session (pool); execute; stream rows into `TupleTableSlot`.
-3. Auth: `nosasl` or Kerberos (`impala/tinybox.dev.vista.zndx.org@VISTA.ZNDX.ORG`).
+3. Auth: `nosasl` or Kerberos (`impala/tinybox.dev.vista.zndx.org@DEV.VISTA.ZNDX.ORG`).
 4. Reject or refuse import if table is not Kudu-backed (check via Impala metadata / TBLPROPERTIES).
 
 **Strengths:** joins (when planned as remote—or multi-scan + local join in PG), complex SQL, Impala–Kudu integration and execution caching for SQL-shaped workloads.
@@ -342,12 +343,17 @@ Use stock PostgreSQL Kerberos support (no proprietary patches required):
 | Piece | signals devenv intent |
 |-------|------------------------|
 | `pg_hba.conf` | `hostgssenc` / `hostgss` (or `host … gss`) for lab host, DB `signals`, method `gss` / `sspi` as appropriate |
-| Service principal | `postgres/tinybox.dev.vista.zndx.org@VISTA.ZNDX.ORG` (already created by `kdc-init.sh`) |
+| Service principal | `postgres/tinybox.dev.vista.zndx.org@DEV.VISTA.ZNDX.ORG` (already created by `kdc-init.sh`) |
 | Keytab | `.devenv/kdc/postgres.keytab` → server `krb_server_keyfile` / env |
 | Client | `psql` / libpq with `host=…` and ticket via `kinit`; prefer GSS-encrypted connections where available |
-| Role mapping | `pg_ident.conf` map: principal `signals@VISTA.ZNDX.ORG` → PG role `signals` (1:1 short name or full principal as role name—pick one convention and document it) |
+| Role mapping | `pg_ident.conf`: `signals@DEV.VISTA.ZNDX.ORG` → PG role `signals` |
 
-**Convention (binding):** PG role name equals the **primary** of the principal when possible (`signals` ↔ `signals@VISTA.ZNDX.ORG`), with `pg_ident` handling realm strip. Avoid opaque role names that cannot be reverse-mapped to a principal.
+**Convention (binding):**
+
+- Realm includes the **env segment**: `{ENV}.{LOCATION}.ZNDX.ORG` (e.g. `DEV.VISTA.ZNDX.ORG`).
+- PG role name equals the Kerberos **primary** only (`signals`), **not** `signals_dev` or env-qualified roles.
+- `pg_ident` strips `@DEV.VISTA.ZNDX.ORG` (full realm). Env is carried by the realm / ticket, not the PG role name.
+- Reverse map for FDW outbound: `CURRENT_USER` + configured `krb_realm` → `signals@DEV.VISTA.ZNDX.ORG`.
 
 Auth methods for local smoke (`trust` / `peer` / `scram`) remain available for CI; GSSAPI is the **lab and product** path.
 
@@ -381,7 +387,7 @@ Both `impala_sql` and `kudu_scan` **must use the same resolved principal** for a
 |------|----------------|
 | `impala_sql` | HS2 client as **resolved client principal** → service `impala/<krb_host>@REALM` |
 | `kudu_scan` | `libkudu_client` as **same client principal** → Kudu SPNs |
-| Devenv | Realm `VISTA.ZNDX.ORG`, host `tinybox.dev.vista.zndx.org`; `KRB5_CONFIG` / `KRB5CCNAME` |
+| Devenv | Realm `DEV.VISTA.ZNDX.ORG`, host `tinybox.dev.vista.zndx.org`; `KRB5_CONFIG` / `KRB5CCNAME` |
 
 #### 11.3.3 SET ROLE and identity
 
@@ -478,7 +484,7 @@ Phase 1 may ship with `nosasl` only if 1b/1c are scheduled immediately after; en
 | Integration | Kudu path vs HS2 path same PK/sample (equivalence) |
 | Integration | RLS: policy blocks SELECT → no data; barrier view recipes |
 | BDD (signals) | Tagger sampling via FDW; AGE join to foreign table; catalog lifecycle |
-| Kerberos | `kinit signals@VISTA.ZNDX.ORG`; PG GSS login; HS2 and Kudu as **same** principal |
+| Kerberos | `kinit signals@DEV.VISTA.ZNDX.ORG`; PG GSS login; HS2 and Kudu as **same** principal |
 | Identity | Assert EXPLAIN/log: `session_principal == outbound_principal` on happy path |
 
 Fixture: small Kudu table `gov_fdw_probe(id INT PK, name STRING, ts BIGINT)` loaded via Impala DDL.
@@ -523,7 +529,8 @@ components/impala_fdw/
 | D6 | Kerberos | **First-class** for Postgres (GSSAPI), Impala, and Kudu; `nosasl`/non-GSS CI only; staged S0–S5 (§11.3.4) |
 | D7 | RLS | **Understand and test** PG RLS + security-barrier views; no silent RLS→Kudu predicate push unless explicitly designed later |
 | D8 | Identity continuity | **Same Kerberos principal** for PG session and FDW outbound Impala/Kudu; prefer delegation/ccache over fixed service keytab |
-| D9 | PG role naming | Map principal primary ↔ role via `pg_ident` (e.g. `signals@REALM` → `signals`) |
+| D9 | PG role naming | Principal **primary** → role via `pg_ident`; env lives in realm (`signals@DEV.VISTA.ZNDX.ORG` → `signals`) |
+| D10 | Realm shape | `{ENV}.{LOCATION}.ZNDX.ORG` (e.g. `DEV.VISTA.ZNDX.ORG`), not location-only `VISTA.ZNDX.ORG` |
 
 ## 19. Success metrics
 
