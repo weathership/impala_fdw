@@ -82,7 +82,10 @@ CREATE SERVER impala_kudu
   OPTIONS (
     host '127.0.0.1',
     port '21050',
-    auth 'nosasl',           -- nosasl | kerberos (later)
+    auth 'kerberos',         -- kerberos | nosasl (devenv convenience)
+    krb_service 'impala',    -- HS2 service principal name component
+    krb_host 'tinybox.dev.vista.zndx.org',
+    krb_realm 'VISTA.ZNDX.ORG',
     kudu_masters '127.0.0.1:7051',
     default_access 'auto'    -- auto | impala_sql | kudu_scan
   );
@@ -92,7 +95,10 @@ CREATE SERVER impala_kudu
 |--------|----------|---------|--------|
 | `host` | no | `127.0.0.1` | Impala HS2 host |
 | `port` | no | `21050` | Impala HS2 port |
-| `auth` | no | `nosasl` | Kerberos later: principal/keytab via env or mapping |
+| `auth` | no | `nosasl` in devenv docs; **design for `kerberos`** | See §11 |
+| `krb_service` | if kerberos | `impala` | Builds `impala/krb_host@REALM` |
+| `krb_host` | if kerberos | `SIGNALS_KRB_HOST` / `tinybox.dev.vista.zndx.org` | SPN instance |
+| `krb_realm` | if kerberos | `VISTA.ZNDX.ORG` | Must match signals KDC |
 | `kudu_masters` | no | `127.0.0.1:7051` | Comma-separated; used by `kudu_scan` path |
 | `default_access` | no | `auto` | Force path for debugging |
 
@@ -101,11 +107,18 @@ CREATE SERVER impala_kudu
 ```sql
 CREATE USER MAPPING FOR CURRENT_USER SERVER impala_kudu
   OPTIONS (
-    /* reserved: kerberos principal, password if ever needed */
+    principal 'signals@VISTA.ZNDX.ORG',   -- optional override
+    keytab '/path/to/signals.keytab'      -- or rely on process ticket cache
   );
 ```
 
-v1: no options for `nosasl`.
+| Option | Notes |
+|--------|--------|
+| `principal` | Client principal for HS2/Kudu; default = OS/krb5 default principal |
+| `keytab` | Optional; prefer `KRB5CCNAME` ticket cache in devenv (`kinit`) |
+| *(none)* | Valid for `auth=nosasl` |
+
+Kerberos is a **first-class** mapping concern: both Impala and Kudu expect GSSAPI-capable clients. Implementation may stage `nosasl` first for CI, but options and code paths must not paint into a corner that assumes no Kerberos.
 
 ### 5.4 Foreign table
 
@@ -283,14 +296,88 @@ Unmapped types: error at CREATE FOREIGN TABLE or first scan with clear message.
 
 ## 11. Security and identity
 
+### 11.1 Tenancy model
+
+**Single-tenant / governance plane.**  
+`impala_fdw` does **not** implement multi-tenant isolation (no per-tenant connection pools, no tenant_id injection, no FDW-level row tenancy). One operators/governance identity plane talks to one Impala/Kudu cluster (signals devenv or a single lab realm).
+
+If multi-tenant productization appears later, it belongs in **Postgres roles + RLS + separate servers/mappings**, or in Impala/Ranger—not ad-hoc logic inside the FDW scan path.
+
+### 11.2 PostgreSQL privileges and RLS
+
+The FDW must **compose with normal Postgres access control**:
+
+| Mechanism | Expected use |
+|-----------|----------------|
+| `GRANT USAGE ON FOREIGN SERVER` | Who may use the server |
+| `GRANT SELECT ON FOREIGN TABLE` | Who may read which foreign tables |
+| **RLS on foreign tables** | PG enforces policies for the local user on the foreign table relation around FDW scan (to the extent PG supports policies on foreign tables) |
+| **RLS / security-barrier views** over foreign tables | Preferred when policies are complex: wrap foreign tables; expose views to less-privileged roles |
+| `SET ROLE` | Session user for PG checks; **remote** Kerberos principal comes from **user mapping**, not from RLS |
+
+**Implementer requirements:**
+
+1. Regression tests: “policy denies → no remote data returned”; document that **RLS expressions are not automatically pushed** as Kudu/Impala predicates unless a future design explicitly does so.
+2. Prefer **security barrier views** when exposing governance data to weaker PG roles.
+3. Never bypass PG permission checks in C code (standard FDW hooks only).
+
+RLS gates **who in Postgres** may initiate a remote read—it is not a substitute for Impala/Kudu Kerberos.
+
+### 11.3 Kerberos (first-class for Impala and Kudu)
+
+Kerberos is a **first-class construct** in both Impala and Kudu. The FDW treats GSSAPI identity as core design, not a bolt-on.
+
+| Path | Kerberos usage |
+|------|----------------|
+| `impala_sql` | HS2 client authenticates as client principal to `impala/<krb_host>@REALM` (SASL/GSSAPI) |
+| `kudu_scan` | `libkudu_client` with Kerberos (Kudu SPN per cluster, typically `kudu/<krb_host>@REALM`) |
+| Devenv | Realm `VISTA.ZNDX.ORG`, host `tinybox.dev.vista.zndx.org`; keytabs under `.devenv/kdc/`; `KRB5_CONFIG` / `KRB5CCNAME` from signals shell |
+
+**Common Postgres + Kerberos patterns we align with:**
+
+| Pattern | Application |
+|---------|-------------|
+| Ticket cache (`KRB5CCNAME`) | Backend inherits env after `kinit`; mapping may omit keytab |
+| Keytab in user mapping | Headless / service role |
+| SPN host = FQDN | `krb_host` = `tinybox.dev.vista.zndx.org`, not only `localhost` |
+| One realm per lab | `VISTA.ZNDX.ORG`; no cross-realm in v1 |
+| `nosasl` | Local CI/devenv only |
+
+**Incremental security rollout (allowed):**
+
+| Stage | Auth | Notes |
+|-------|------|--------|
+| S0 | `nosasl` | Phase 1–2 CI; no KDC required for FDW unit/integration smoke |
+| S1 | Kerberos on **Impala HS2** | Phase 1b—GSSAPI HS2 with signals KDC |
+| S2 | Kerberos on **Kudu client** | Phase 3b with `kudu_scan` |
+| S3 | Optional Impala Ranger on HS2 path | Orthogonal to FDW |
+| S4 | Disable `nosasl` outside dev profiles | Config/docs |
+
+Stages may ship independently; **Kerberos options and code structure exist from the start**.
+
+### 11.4 Summary table
+
 | Concern | Behavior |
 |---------|----------|
-| PG privileges | Standard FDW: USAGE on server/table |
-| Impala/Kudu auth | Server + user mapping; Kerberos later with signals KDC |
-| Ranger | Not enforced inside FDW; production query paths that need Ranger should use Impala HS2 with plugin, or accept that FDW reads are trusted-operator/governance plane |
-| Credentials | No secrets in table options; keytabs via env / mapping |
+| Multi-tenancy | **Out of scope** for the FDW |
+| PG privileges | USAGE / SELECT; standard FDW |
+| PG RLS | Supported via PG; test deny/allow; no silent RLS→remote predicate push |
+| Impala auth | Kerberos first-class; nosasl for devenv |
+| Kudu auth | Kerberos first-class with client; insecure only if cluster allows (devenv) |
+| Ranger | Not inside FDW; optional on Impala for HS2 later |
+| Secrets | Keytabs/paths in mapping or env—not in table options |
 
-Document clearly: **governance-plane FDW access is a privileged path** in devenv; production hardening may require Impala-only + Ranger for untrusted tenants.
+### 11.5 Language and libraries (binding)
+
+| Component | Technology |
+|-----------|------------|
+| FDW entry / planner | C (PostgreSQL FDW API / PGXS) |
+| Path selector, type map | C |
+| `impala_sql` client | **C/C++** HS2 thrift client (no JDBC-in-process) |
+| `kudu_scan` client | **C++** `libkudu_client` (from `components/kudu` or devenv prefix) |
+| Build | g++/clang as required by libkudu_client; Makefile/PGXS for C++ objects |
+
+Java remains acceptable for **out-of-process** tooling (tests, Impala FE), not for the extension `.so`.
 
 ## 12. Observability
 
@@ -314,14 +401,16 @@ Document clearly: **governance-plane FDW access is a privileged path** in devenv
 | Phase | Deliverable | Exit criteria |
 |-------|-------------|---------------|
 | **0** | Scaffold (current) | Extension loads; validator; clear error on scan |
-| **1** | Type map + HS2 client + simple foreign scan | `SELECT` projected cols from one Kudu table via Impala |
+| **1** | Type map + **C/C++ HS2** client + simple foreign scan (`nosasl`) | `SELECT` projected cols from one Kudu table via Impala |
+| **1b** | Kerberos options + **HS2 GSSAPI** against signals KDC | `auth=kerberos` works with `kinit` / keytab mapping |
 | **2** | Pushdown + LIMIT + EXPLAIN path label | Predicate push; EXPLAIN shows impala_sql |
-| **3** | Kudu client + `gov.pk_lookup` + `gov.column_sample` | Equivalence tests vs HS2; EXPLAIN shows kudu_scan |
+| **3** | **C++ libkudu_client** + `gov.pk_lookup` + `gov.column_sample` | Equivalence tests vs HS2; EXPLAIN shows kudu_scan |
+| **3b** | Kerberos on Kudu client path | `kudu_scan` with secured cluster |
 | **4** | Full shape catalog + selector GUCs + fallback | All §6 shapes classified; BDD in signals |
 | **5** | IMPORT FOREIGN SCHEMA (kudu_only) | Import default DB Kudu tables |
-| **6** | Kerberos | HS2 + optional Kudu ticket path with `VISTA.ZNDX.ORG` |
+| **6** | RLS regression suite + security-barrier view recipes | Documented patterns; CI policies deny/allow |
 
-Phase 1 may ship before any Kudu client code; phase 3 is where governance optimization lands.
+Phase 1 may ship with `nosasl` only if 1b is scheduled immediately after; Kerberos is not optional long-term.
 
 ## 15. Testing strategy
 
@@ -329,9 +418,11 @@ Phase 1 may ship before any Kudu client code; phase 3 is where governance optimi
 |-------|------|
 | Unit | Shape classifier (quals, PK, LIMIT → shape id) |
 | Unit | Type mapping round-trip |
-| Integration | HS2 scan against signals devenv Impala+Kudu |
+| Integration | HS2 scan against signals devenv Impala+Kudu (`nosasl` + Kerberos) |
 | Integration | Kudu path vs HS2 path same PK/sample (equivalence) |
+| Integration | RLS: policy blocks SELECT → no data; barrier view recipes |
 | BDD (signals) | Tagger sampling via FDW; AGE join to foreign table; catalog lifecycle |
+| Kerberos | `kinit signals@VISTA.ZNDX.ORG`; HS2 and Kudu paths with real SPNs |
 
 Fixture: small Kudu table `gov_fdw_probe(id INT PK, name STRING, ts BIGINT)` loaded via Impala DDL.
 
@@ -352,32 +443,37 @@ components/impala_fdw/
   docs/SPEC.md              ← this document
   docs/design.md            ← short pointer + changelog of intent
   src/
-    impala_fdw.c            ← FDW entry / planner glue
-    path_select.c/h         ← shape id + access method
-    exec_impala.c/h         ← HS2 executor
-    exec_kudu.c/h           ← Kudu scanner executor
+    impala_fdw.c            ← FDW entry / planner glue (C)
+    path_select.c/h         ← shape id + access method (C)
+    exec_impala.cpp/h       ← HS2 executor (C++)
+    exec_kudu.cpp/h         ← Kudu scanner (C++ / libkudu_client)
     type_map.c/h
     options.c/h
+    krb_util.c/h            ← ticket cache / keytab helpers
   sql/
-  Makefile
+  Makefile                  ← PGXS + C++ link against kudu_client
 ```
 
-## 18. Open decisions (resolve in phase 1–3)
+## 18. Decisions
 
-| # | Decision | Options | Lean |
-|---|----------|---------|------|
-| D1 | HS2 client implementation | C thrift / linked JDBC bridge / subprocess | C thrift or Impala-compatible HS2 lib if available |
-| D2 | Kudu client | Official C++ `libkudu_client` vs Java bridge | C++ client in FDW .so (matches Kudu subtree) |
-| D3 | Join pushdown to Impala | Never in v1 / rewrite multi-table foreign joins | Never in v1—PG local join |
-| D4 | Sample algorithm | First-N scan vs random | First-N with optional predicate; random later |
-| D5 | Production multi-tenant | FDW trusted only / must use Impala+Ranger | Document trusted governance plane for devenv |
+| # | Decision | Resolution |
+|---|----------|------------|
+| D1 | HS2 client | **C/C++ thrift HS2 client** in-process—not JDBC/Java |
+| D2 | Kudu client | **C++ `libkudu_client`** linked into the extension |
+| D3 | Join pushdown to Impala | **Never in v1**—joins in Postgres |
+| D4 | Sample algorithm | **First-N** scan (+ optional preds); random later |
+| D5 | Multi-tenancy | **Out of scope**—single governance plane; use PG roles/RLS + Kerberos identity, not FDW tenants |
+| D6 | Kerberos | **First-class** for Impala and Kudu; `nosasl` devenv/CI only; staged S0–S4 (§11.3) |
+| D7 | RLS | **Understand and test** PG RLS + security-barrier views; no silent RLS→Kudu predicate push unless explicitly designed later |
 
 ## 19. Success metrics
 
 - Governance PK lookup p99 latency: Kudu path ≪ HS2 path on warm local devenv  
 - Equivalence: 0 row mismatches on probe table for §6 Kudu-eligible shapes  
 - Partner/demo path: `impala_sql` executes multi-table Kudu SQL without using Kudu path  
-- No Iceberg tables importable when `kudu_only=true`
+- No Iceberg tables importable when `kudu_only=true`  
+- Kerberos: HS2 path succeeds with `auth=kerberos` against signals KDC  
+- RLS: documented deny/allow cases pass CI  
 
 ---
 
@@ -386,3 +482,4 @@ components/impala_fdw/
 | Ver | Date | Note |
 |-----|------|------|
 | 0.1 | 2026-08-05 | Initial binding spec: dual path, governance catalog, Kudu-only |
+| 0.2 | 2026-08-05 | C/C++ binding; single-tenant; Kerberos first-class; PG RLS patterns |
