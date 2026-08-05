@@ -466,9 +466,9 @@ Java remains acceptable for **out-of-process** tooling (tests, Impala FE), not f
 
 | Phase | Deliverable | Exit criteria |
 |-------|-------------|---------------|
-| **0** | Scaffold (current) | Extension loads; validator; clear error on scan |
-| **1** | Type map + **C/C++ HS2** client + simple foreign scan (`nosasl`) | `SELECT` projected cols from one Kudu table via Impala |
-| **1b** | Kerberos options + **HS2 GSSAPI** (principal from mapping/ccache) | `auth=kerberos` with signals KDC |
+| **0** | Scaffold | Extension loads; validator |
+| **1** | **C/C++ HS2 thrift** + foreign scan (`nosasl`) | OpenSession/Execute/Fetch; FDW SELECT; `tools/hs2_smoke` |
+| **1b** | Kerberos + **HS2 GSSAPI/SASL** | `auth=kerberos` with signals KDC |
 | **1c** | **Postgres GSSAPI** (`pg_hba`, postgres SPN, `pg_ident`) + principal resolution | GSS login as `signals@…` → role `signals` |
 | **2** | Pushdown + LIMIT + EXPLAIN path label | Predicate push; EXPLAIN shows impala_sql |
 | **2b** | **Same principal** PG session → HS2 (S2) | Audit: outbound principal equals GSS identity |

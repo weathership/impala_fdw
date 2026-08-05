@@ -39,19 +39,28 @@ HS2/Kudu executors land.
 
 ## Build
 
-Requires PostgreSQL development headers (`postgresql_16.dev` / `pg_config`).
+Requires PostgreSQL dev headers (`pg_config`), **Apache Thrift**, and **Boost** headers
+(thrift 0.22 depends on boost). In signals devenv these are provided as packages.
 
 ```bash
-make          # uses pg_config from PATH
-make install  # may need DESTDIR / sudo depending on prefix
-```
-
-In signals devenv:
-
-```bash
+# devenv (recommended)
 just impala-fdw-build
 # or: devenv tasks run impala-fdw:build
+
+# manual
+export THRIFT_HOME=... BOOST_HOME=...   # nix paths or system prefixes
+make with_llvm=no
+make install   # into PG prefix
 ```
+
+HS2 smoke (Impala must be listening on :21050, auth nosasl):
+
+```bash
+make hs2-smoke && ./tools/hs2_smoke 127.0.0.1 21050
+```
+
+Phase 1 uses **NOSASL** thrift to de-risk deps; product path is still Kerberos (1b).
+
 
 ## Usage (planned)
 
