@@ -1,7 +1,9 @@
 # impala_fdw specification
 
-**Status:** Draft v0.1 (binding intent for implementation)  
+**Status:** Draft v0.2 (binding intent for implementation)  
 **Storage scope:** Kudu-backed Impala tables only  
+**Implementation language:** **C/C++** (PostgreSQL FDW + libkudu_client + HS2 thrift client)—no Java runtime in the extension process  
+**Tenancy:** **Single-tenant / governance-plane** (no multi-tenant isolation inside the FDW)  
 **Consumers:** signals-360 Postgres (AGE / Atlas graph co-location, Ranger policy helpers, sigint sampling)
 
 ## 1. Purpose
@@ -11,6 +13,7 @@
 - **Public contract:** SQL-shaped access to Kudu tables for Postgres clients (governance, AGE joins, analytics).
 - **Default remote engine:** **Apache Impala** over HiveServer2 (HS2)—the co-developed SQL engine on Kudu, including planner and in-memory execution benefits for SQL-shaped work.
 - **Specialized paths:** For the **closed Atlas + Ranger + AGE + sigint** query algebra, the extension may execute **direct Kudu client** scans when that is faster and semantically equivalent—without exposing a second FDW product.
+- **Native stack:** Executors and clients are **C/C++**, matching Impala/Kudu’s native libraries and PostgreSQL’s FDW ABI—avoid JVM bridges in-process.
 
 Postgres remains the primary front end for graph/governance SQL. Kudu remains the only storage backend in scope. Impala is the default SQL adapter and the escape hatch for ad-hoc / multi-table SQL.
 
@@ -33,6 +36,9 @@ PostgreSQL (:5455)
 | G4 | Single extension, single type-mapping layer, dual executors |
 | G5 | Align with signals devenv: PG 16 :5455, Impala HS2 :21050, Kudu masters :7051, realm `VISTA.ZNDX.ORG` |
 | G6 | Kudu storage only—no Iceberg / HDFS / other Impala formats in v1 |
+| G7 | **C/C++ only** for extension code and remote clients (PGXS, libkudu_client, HS2 thrift/C++) |
+| G8 | **Kerberos as a first-class identity path** for Impala HS2 and Kudu (aligned with signals KDC), even if rollout is phased |
+| G9 | Interoperate cleanly with **PostgreSQL RLS** and standard PG privilege patterns (USAGE/SELECT on foreign tables)—without multi-tenant FDW logic |
 
 ## 3. Non-goals
 
@@ -44,7 +50,9 @@ PostgreSQL (:5455)
 | N4 | Replacing Atlas REST, AGE schema, or Ranger policy evaluation engines |
 | N5 | Running Hive Metastore or standalone HiveServer2 |
 | N6 | Beeswax client support |
-| N7 | Authorization inside the FDW (Ranger/Impala remain authoritative at query-engine boundary; PG roles gate who may use the FDW) |
+| N7 | Implementing a full authz engine *inside* the FDW (no second Ranger) |
+| N8 | **Multi-tenancy** inside impala_fdw (no per-tenant connection isolation, no tenant row filters in the FDW) |
+| N9 | Java/JDBC-in-process client for HS2 or Kudu |
 
 ## 4. Design principles
 
@@ -54,6 +62,9 @@ PostgreSQL (:5455)
 4. **One type system** — Impala/Kudu/Postgres type mapping lives in one module used by both executors.
 5. **Explainability** — `EXPLAIN` / `EXPLAIN (VERBOSE)` must show which access method was chosen and why (or a shape id).
 6. **Fail closed on storage** — If a foreign table is not Kudu-backed, create/import or first scan errors clearly.
+7. **C/C++ native** — Prefer linking official/native clients; no JVM in the backend process.
+8. **Kerberos-first identity model** — Design options, user mapping, and connection setup for Kerberos from day one; `nosasl` is a devenv convenience, not the long-term default story.
+9. **Postgres-native access control** — Rely on PG roles, GRANT, and RLS on foreign tables / wrapping views; FDW does not invent tenants.
 
 ## 5. Objects and options
 

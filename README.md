@@ -25,8 +25,10 @@ phased implementation.
 
 ## Status
 
-Scaffold / MVP. Builds as a PostgreSQL 16 extension; foreign table scans are
-stubs until the HS2 client path lands.
+Scaffold / MVP. Builds as a PostgreSQL 16 extension (**C/C++** clients).
+Kerberos is first-class for Impala and Kudu; multi-tenancy is out of scope
+for the FDW (use Postgres GRANT/RLS). Foreign table scans are stubs until
+HS2/Kudu executors land.
 
 | Target | Default (signals devenv) |
 |--------|---------------------------|

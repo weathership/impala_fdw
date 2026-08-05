@@ -8,7 +8,9 @@ This file is a short orientation; do not diverge from SPEC.md.
 
 PostgreSQL FDW for **Kudu-only** tables: **Impala HS2 by default** (SQL-shaped,
 Cloudera-aligned), with **direct Kudu scans** for the closed Atlas / Ranger /
-AGE / sigint governance algebra.
+AGE / sigint governance algebra. Implemented in **C/C++** (`libkudu_client` +
+HS2 thrift). **Kerberos** is first-class for Impala and Kudu; **no multi-tenancy**
+in the FDW—use Postgres GRANT/RLS for local access control.
 
 ## Topology
 
