@@ -1,7 +1,10 @@
 /*-------------------------------------------------------------------------
  *
  * impala_fdw.c
- *    Foreign Data Wrapper for Apache Impala (HS2).
+ *    Foreign Data Wrapper for Apache Impala (HS2) → Kudu storage only.
+ *
+ * Scope: foreign tables map to Impala tables backed by Kudu. Iceberg and
+ * other Impala formats are out of scope for v1.
  *
  * Scaffold: registers FDW routines; BeginForeignScan raises until HS2
  * client integration is implemented.
@@ -239,12 +242,13 @@ impalaBeginForeignScan(ForeignScanState *node, int eflags)
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 			 errmsg("impala_fdw: Impala HS2 scan not implemented yet"),
-			 errdetail("Would scan %s.%s via %s:%d",
+			 errdetail("Would scan Kudu-backed table %s.%s via HS2 %s:%d",
 					   festate->database,
 					   festate->table ? festate->table : "(unset)",
 					   festate->host,
 					   festate->port),
-			 errhint("Wire the HS2 client in IterateForeignScan; signals devenv HS2 is localhost:21050.")));
+			 errhint("Wire the HS2 client in IterateForeignScan; only Kudu storage is in scope. "
+					 "Signals devenv HS2 is localhost:21050.")));
 
 	(void) fsplan;
 }

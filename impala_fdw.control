@@ -1,5 +1,5 @@
 # impala_fdw extension
-comment = 'Foreign Data Wrapper for Apache Impala (HS2)'
+comment = 'Foreign Data Wrapper for Impala HS2 (Kudu storage only)'
 default_version = '0.1.0'
 module_pathname = '$libdir/impala_fdw'
 relocatable = true
