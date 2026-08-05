@@ -1,9 +1,10 @@
 # impala_fdw specification
 
-**Status:** Draft v0.2 (binding intent for implementation)  
+**Status:** Draft v0.3 (binding intent for implementation)  
 **Storage scope:** Kudu-backed Impala tables only  
 **Implementation language:** **C/C++** (PostgreSQL FDW + libkudu_client + HS2 thrift client)—no Java runtime in the extension process  
 **Tenancy:** **Single-tenant / governance-plane** (no multi-tenant isolation inside the FDW)  
+**Identity:** **End-to-end Kerberos** — Postgres GSSAPI session user ↔ same principal for Impala/Kudu when possible  
 **Consumers:** signals-360 Postgres (AGE / Atlas graph co-location, Ranger policy helpers, sigint sampling)
 
 ## 1. Purpose
