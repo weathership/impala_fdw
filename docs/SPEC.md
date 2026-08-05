@@ -40,6 +40,7 @@ PostgreSQL (:5455)
 | G7 | **C/C++ only** for extension code and remote clients (PGXS, libkudu_client, HS2 thrift/C++) |
 | G8 | **Kerberos as a first-class identity path** for Impala HS2 and Kudu (aligned with signals KDC), even if rollout is phased |
 | G9 | Interoperate cleanly with **PostgreSQL RLS** and standard PG privilege patterns (USAGE/SELECT on foreign tables)—without multi-tenant FDW logic |
+| G10 | **Postgres GSSAPI login** (community Kerberos auth) so the PG role maps to a Kerberos principal, and **prefer the same principal** for FDW outbound Impala/Kudu authentication |
 
 ## 3. Non-goals
 
@@ -66,6 +67,7 @@ PostgreSQL (:5455)
 7. **C/C++ native** — Prefer linking official/native clients; no JVM in the backend process.
 8. **Kerberos-first identity model** — Design options, user mapping, and connection setup for Kerberos from day one; `nosasl` is a devenv convenience, not the long-term default story.
 9. **Postgres-native access control** — Rely on PG roles, GRANT, and RLS on foreign tables / wrapping views; FDW does not invent tenants.
+10. **One principal end-to-end** — When the client authenticates to Postgres with GSSAPI, the FDW should authenticate to Impala/Kudu as **that same Kerberos principal** (not a fixed service keytab), using ticket cache / delegation patterns where the platform supports them.
 
 ## 5. Objects and options
 
@@ -314,7 +316,7 @@ The FDW must **compose with normal Postgres access control**:
 | `GRANT SELECT ON FOREIGN TABLE` | Who may read which foreign tables |
 | **RLS on foreign tables** | PG enforces policies for the local user on the foreign table relation around FDW scan (to the extent PG supports policies on foreign tables) |
 | **RLS / security-barrier views** over foreign tables | Preferred when policies are complex: wrap foreign tables; expose views to less-privileged roles |
-| `SET ROLE` | Session user for PG checks; **remote** Kerberos principal comes from **user mapping**, not from RLS |
+| `SET ROLE` | Changes PG authorization name for GRANT/RLS; **does not** by itself change the Kerberos principal used for Impala/Kudu (see §11.3.2) |
 
 **Implementer requirements:**
 
@@ -324,49 +326,100 @@ The FDW must **compose with normal Postgres access control**:
 
 RLS gates **who in Postgres** may initiate a remote read—it is not a substitute for Impala/Kudu Kerberos.
 
-### 11.3 Kerberos (first-class for Impala and Kudu)
+### 11.3 End-to-end Kerberos identity
 
-Kerberos is a **first-class construct** in both Impala and Kudu. The FDW treats GSSAPI identity as core design, not a bolt-on.
+Kerberos is a **first-class construct** in **Postgres** (community GSSAPI auth), **Impala**, and **Kudu**. The design goal is a **single principal** for a query:
+
+```text
+Client  --GSSAPI-->  PostgreSQL  --same principal-->  Impala HS2 / Kudu
+         (login)      (session)     (FDW outbound)
+```
+
+#### 11.3.1 Postgres GSSAPI (inbound)
+
+Use stock PostgreSQL Kerberos support (no proprietary patches required):
+
+| Piece | signals devenv intent |
+|-------|------------------------|
+| `pg_hba.conf` | `hostgssenc` / `hostgss` (or `host … gss`) for lab host, DB `signals`, method `gss` / `sspi` as appropriate |
+| Service principal | `postgres/tinybox.dev.vista.zndx.org@VISTA.ZNDX.ORG` (already created by `kdc-init.sh`) |
+| Keytab | `.devenv/kdc/postgres.keytab` → server `krb_server_keyfile` / env |
+| Client | `psql` / libpq with `host=…` and ticket via `kinit`; prefer GSS-encrypted connections where available |
+| Role mapping | `pg_ident.conf` map: principal `signals@VISTA.ZNDX.ORG` → PG role `signals` (1:1 short name or full principal as role name—pick one convention and document it) |
+
+**Convention (binding):** PG role name equals the **primary** of the principal when possible (`signals` ↔ `signals@VISTA.ZNDX.ORG`), with `pg_ident` handling realm strip. Avoid opaque role names that cannot be reverse-mapped to a principal.
+
+Auth methods for local smoke (`trust` / `peer` / `scram`) remain available for CI; GSSAPI is the **lab and product** path.
+
+#### 11.3.2 Same principal for Impala and Kudu (outbound)
+
+When a session was established with GSSAPI, the FDW **must prefer** authenticating to Impala/Kudu as **that client principal**, not a fixed shared service account.
+
+| Mechanism | When to use | Notes |
+|-----------|-------------|--------|
+| **A. Forwarded credentials / delegated TGT** | Client requested ticket forwarding; backend can obtain service tickets as the user | Ideal end-to-end; depends on libpq/GSS and KDC `OK_AS_DELEGATE` / forwardable flags |
+| **B. Per-session credential cache** | Backend associates a ccache with the session (forwarded or S4U) | FDW reads ccache for HS2 and `libkudu_client` |
+| **C. User mapping principal = session user** | Mapping says `principal` from `CURRENT_USER` + realm; ticket already in process ccache from login path | Common lab pattern: same OS user/`kinit` as PG role |
+| **D. Keytab per principal** | Headless jobs; mapping points at keytab for that principal only | Still “same identity”; not multi-tenant pooling |
+| **E. Fixed service keytab** | Break-glass / early CI only | **Discouraged** for product: collapses all PG users to one Impala/Kudu identity |
+
+**Target product behavior:** A or B when platform allows; **C/D** as devenv default with explicit documentation. **E** only for `auth=nosasl` era or emergency.
+
+**Resolution algorithm (outbound principal):**
+
+```
+1. If user mapping sets principal explicitly → use it (must match session policy or superuser-only).
+2. Else if session has GSS auth identity (pg_authid / GSS display name) → principal = that identity (+ realm if stripped).
+3. Else if CURRENT_USER maps via pg_ident reverse / convention → principal = role@REALM.
+4. Else if auth=nosasl → no Kerberos principal.
+5. Else ERROR: cannot determine outbound Kerberos principal.
+```
+
+Both `impala_sql` and `kudu_scan` **must use the same resolved principal** for a given scan so Ranger/audit trails stay consistent across paths.
 
 | Path | Kerberos usage |
 |------|----------------|
-| `impala_sql` | HS2 client authenticates as client principal to `impala/<krb_host>@REALM` (SASL/GSSAPI) |
-| `kudu_scan` | `libkudu_client` with Kerberos (Kudu SPN per cluster, typically `kudu/<krb_host>@REALM`) |
-| Devenv | Realm `VISTA.ZNDX.ORG`, host `tinybox.dev.vista.zndx.org`; keytabs under `.devenv/kdc/`; `KRB5_CONFIG` / `KRB5CCNAME` from signals shell |
+| `impala_sql` | HS2 client as **resolved client principal** → service `impala/<krb_host>@REALM` |
+| `kudu_scan` | `libkudu_client` as **same client principal** → Kudu SPNs |
+| Devenv | Realm `VISTA.ZNDX.ORG`, host `tinybox.dev.vista.zndx.org`; `KRB5_CONFIG` / `KRB5CCNAME` |
 
-**Common Postgres + Kerberos patterns we align with:**
+#### 11.3.3 SET ROLE and identity
 
-| Pattern | Application |
-|---------|-------------|
-| Ticket cache (`KRB5CCNAME`) | Backend inherits env after `kinit`; mapping may omit keytab |
-| Keytab in user mapping | Headless / service role |
-| SPN host = FQDN | `krb_host` = `tinybox.dev.vista.zndx.org`, not only `localhost` |
-| One realm per lab | `VISTA.ZNDX.ORG`; no cross-realm in v1 |
-| `nosasl` | Local CI/devenv only |
+| Action | PG GRANT/RLS | Impala/Kudu principal |
+|--------|--------------|------------------------|
+| Initial GSS login as `signals` | as `signals` | `signals@…` |
+| `SET ROLE analyst` (no new GSS) | as `analyst` | Still `signals@…` unless mapping forces otherwise—**document**; prefer not to allow SET ROLE to a role without its own mapping |
+| `SET ROLE` to role with its own USER MAPPING | as that role | Mapping’s principal / keytab |
 
-**Incremental security rollout (allowed):**
+Mismatch between PG role and outbound principal is a footgun for audit; **CI should assert** GSS session → outbound principal equality for the happy path.
+
+#### 11.3.4 Incremental security rollout
 
 | Stage | Auth | Notes |
 |-------|------|--------|
-| S0 | `nosasl` | Phase 1–2 CI; no KDC required for FDW unit/integration smoke |
-| S1 | Kerberos on **Impala HS2** | Phase 1b—GSSAPI HS2 with signals KDC |
-| S2 | Kerberos on **Kudu client** | Phase 3b with `kudu_scan` |
-| S3 | Optional Impala Ranger on HS2 path | Orthogonal to FDW |
-| S4 | Disable `nosasl` outside dev profiles | Config/docs |
+| S0 | PG trust/scram + Impala/Kudu `nosasl` | CI without KDC |
+| S1 | **PG GSSAPI login** + Impala/Kudu still nosasl (identity logged only) | Prove pg_hba + postgres SPN |
+| S2 | PG GSSAPI + **Impala HS2 as same principal** | End-to-end for `impala_sql` |
+| S3 | PG GSSAPI + **Kudu client as same principal** | End-to-end for `kudu_scan` |
+| S4 | Optional Impala Ranger (sees real user principal) | Orthogonal to FDW |
+| S5 | Disable nosasl / non-GSS PG in non-dev profiles | Config/docs |
 
-Stages may ship independently; **Kerberos options and code structure exist from the start**.
+Stages may ship independently; **options and resolution algorithm are designed for S2–S3 from the start**.
 
 ### 11.4 Summary table
 
 | Concern | Behavior |
 |---------|----------|
 | Multi-tenancy | **Out of scope** for the FDW |
+| PG login | **GSSAPI/Kerberos** first-class (community support); trust/scram for CI |
+| Identity continuity | **Same principal** PG session → Impala/Kudu when Kerberos path is active |
 | PG privileges | USAGE / SELECT; standard FDW |
 | PG RLS | Supported via PG; test deny/allow; no silent RLS→remote predicate push |
-| Impala auth | Kerberos first-class; nosasl for devenv |
-| Kudu auth | Kerberos first-class with client; insecure only if cluster allows (devenv) |
-| Ranger | Not inside FDW; optional on Impala for HS2 later |
-| Secrets | Keytabs/paths in mapping or env—not in table options |
+| Impala auth | Kerberos first-class as **session principal** |
+| Kudu auth | Kerberos first-class as **same session principal** |
+| Ranger | Not inside FDW; benefits when HS2 sees real user principal |
+| Secrets | Keytabs/ccache paths in mapping or env—not in table options |
+| Shared service account | Escape hatch only—not the product identity model |
 
 ### 11.5 Language and libraries (binding)
 
@@ -403,15 +456,17 @@ Java remains acceptable for **out-of-process** tooling (tests, Impala FE), not f
 |-------|-------------|---------------|
 | **0** | Scaffold (current) | Extension loads; validator; clear error on scan |
 | **1** | Type map + **C/C++ HS2** client + simple foreign scan (`nosasl`) | `SELECT` projected cols from one Kudu table via Impala |
-| **1b** | Kerberos options + **HS2 GSSAPI** against signals KDC | `auth=kerberos` works with `kinit` / keytab mapping |
+| **1b** | Kerberos options + **HS2 GSSAPI** (principal from mapping/ccache) | `auth=kerberos` with signals KDC |
+| **1c** | **Postgres GSSAPI** (`pg_hba`, postgres SPN, `pg_ident`) + principal resolution | GSS login as `signals@…` → role `signals` |
 | **2** | Pushdown + LIMIT + EXPLAIN path label | Predicate push; EXPLAIN shows impala_sql |
+| **2b** | **Same principal** PG session → HS2 (S2) | Audit: outbound principal equals GSS identity |
 | **3** | **C++ libkudu_client** + `gov.pk_lookup` + `gov.column_sample` | Equivalence tests vs HS2; EXPLAIN shows kudu_scan |
-| **3b** | Kerberos on Kudu client path | `kudu_scan` with secured cluster |
+| **3b** | Same principal on **Kudu client** path (S3) | `kudu_scan` with secured cluster as session user |
 | **4** | Full shape catalog + selector GUCs + fallback | All §6 shapes classified; BDD in signals |
 | **5** | IMPORT FOREIGN SCHEMA (kudu_only) | Import default DB Kudu tables |
 | **6** | RLS regression suite + security-barrier view recipes | Documented patterns; CI policies deny/allow |
 
-Phase 1 may ship with `nosasl` only if 1b is scheduled immediately after; Kerberos is not optional long-term.
+Phase 1 may ship with `nosasl` only if 1b/1c are scheduled immediately after; end-to-end Kerberos identity is product intent, not optional polish.
 
 ## 15. Testing strategy
 
@@ -423,7 +478,8 @@ Phase 1 may ship with `nosasl` only if 1b is scheduled immediately after; Kerber
 | Integration | Kudu path vs HS2 path same PK/sample (equivalence) |
 | Integration | RLS: policy blocks SELECT → no data; barrier view recipes |
 | BDD (signals) | Tagger sampling via FDW; AGE join to foreign table; catalog lifecycle |
-| Kerberos | `kinit signals@VISTA.ZNDX.ORG`; HS2 and Kudu paths with real SPNs |
+| Kerberos | `kinit signals@VISTA.ZNDX.ORG`; PG GSS login; HS2 and Kudu as **same** principal |
+| Identity | Assert EXPLAIN/log: `session_principal == outbound_principal` on happy path |
 
 Fixture: small Kudu table `gov_fdw_probe(id INT PK, name STRING, ts BIGINT)` loaded via Impala DDL.
 
@@ -464,8 +520,10 @@ components/impala_fdw/
 | D3 | Join pushdown to Impala | **Never in v1**—joins in Postgres |
 | D4 | Sample algorithm | **First-N** scan (+ optional preds); random later |
 | D5 | Multi-tenancy | **Out of scope**—single governance plane; use PG roles/RLS + Kerberos identity, not FDW tenants |
-| D6 | Kerberos | **First-class** for Impala and Kudu; `nosasl` devenv/CI only; staged S0–S4 (§11.3) |
+| D6 | Kerberos | **First-class** for Postgres (GSSAPI), Impala, and Kudu; `nosasl`/non-GSS CI only; staged S0–S5 (§11.3.4) |
 | D7 | RLS | **Understand and test** PG RLS + security-barrier views; no silent RLS→Kudu predicate push unless explicitly designed later |
+| D8 | Identity continuity | **Same Kerberos principal** for PG session and FDW outbound Impala/Kudu; prefer delegation/ccache over fixed service keytab |
+| D9 | PG role naming | Map principal primary ↔ role via `pg_ident` (e.g. `signals@REALM` → `signals`) |
 
 ## 19. Success metrics
 
@@ -474,6 +532,7 @@ components/impala_fdw/
 - Partner/demo path: `impala_sql` executes multi-table Kudu SQL without using Kudu path  
 - No Iceberg tables importable when `kudu_only=true`  
 - Kerberos: HS2 path succeeds with `auth=kerberos` against signals KDC  
+- End-to-end: GSS login to Postgres and Impala/Kudu use the **same** principal  
 - RLS: documented deny/allow cases pass CI  
 
 ---
@@ -484,3 +543,4 @@ components/impala_fdw/
 |-----|------|------|
 | 0.1 | 2026-08-05 | Initial binding spec: dual path, governance catalog, Kudu-only |
 | 0.2 | 2026-08-05 | C/C++ binding; single-tenant; Kerberos first-class; PG RLS patterns |
+| 0.3 | 2026-08-05 | Postgres GSSAPI + same principal to Impala/Kudu (end-to-end identity) |
