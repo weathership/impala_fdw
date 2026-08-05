@@ -4,7 +4,7 @@
 **Storage scope:** Kudu-backed Impala tables only  
 **Implementation language:** **C/C++** (PostgreSQL FDW + libkudu_client + HS2 thrift client)—no Java runtime in the extension process  
 **Tenancy:** **Single-tenant / governance-plane** (no multi-tenant isolation inside the FDW)  
-**Identity:** **End-to-end Kerberos** — Postgres GSSAPI session user ↔ same principal for Impala/Kudu when possible  
+**Identity:** **Kerberos is the expected identity plane for all signals users** of this stack  
 **Realm:** **`{ENV}.{LOCATION}.ZNDX.ORG`** (e.g. `DEV.VISTA.ZNDX.ORG`); PG role = principal **primary** only (`signals@DEV.…` → `signals`)  
 **Consumers:** signals-360 Postgres (AGE / Atlas graph co-location, Ranger policy helpers, sigint sampling)
 
@@ -355,7 +355,11 @@ Use stock PostgreSQL Kerberos support (no proprietary patches required):
 - `pg_ident` strips `@DEV.VISTA.ZNDX.ORG` (full realm). Env is carried by the realm / ticket, not the PG role name.
 - Reverse map for FDW outbound: `CURRENT_USER` + configured `krb_realm` → `signals@DEV.VISTA.ZNDX.ORG`.
 
-Auth methods for local smoke (`trust` / `peer` / `scram`) remain available for CI; GSSAPI is the **lab and product** path.
+**signals repo posture:** components here (Postgres GSSAPI, Impala, Kudu, FDW, Atlas SPNEGO later) **support or require Kerberos**. All interactive and service users of the signals stack are expected to hold tickets in `DEV.VISTA.ZNDX.ORG` (or the active env realm).  
+
+**Not yet:** org-wide end-to-end security or a required gRPC security mesh. A future **gRPC engine** should join the **same Kerberos federation** (same realm / principal conventions); that is out of band for this FDW until the engine lands.  
+
+`trust` / `peer` / `scram` / Impala `nosasl` remain for **CI and bootstrap only**, not as a parallel product identity model.
 
 #### 11.3.2 Same principal for Impala and Kudu (outbound)
 
@@ -404,14 +408,15 @@ Mismatch between PG role and outbound principal is a footgun for audit; **CI sho
 
 | Stage | Auth | Notes |
 |-------|------|--------|
-| S0 | PG trust/scram + Impala/Kudu `nosasl` | CI without KDC |
-| S1 | **PG GSSAPI login** + Impala/Kudu still nosasl (identity logged only) | Prove pg_hba + postgres SPN |
+| S0 | PG trust/scram + Impala/Kudu `nosasl` | **CI/bootstrap only** — not a product path |
+| S1 | **PG GSSAPI login** (all signals users) | Prove pg_hba + postgres SPN + pg_ident |
 | S2 | PG GSSAPI + **Impala HS2 as same principal** | End-to-end for `impala_sql` |
 | S3 | PG GSSAPI + **Kudu client as same principal** | End-to-end for `kudu_scan` |
-| S4 | Optional Impala Ranger (sees real user principal) | Orthogonal to FDW |
-| S5 | Disable nosasl / non-GSS PG in non-dev profiles | Config/docs |
+| S4 | Impala Ranger (sees real user principal) | Optional product; needs real principals |
+| S5 | Lab default: Kerberos-only for PG + Impala + Kudu | nosasl off outside CI |
+| S6 | **gRPC engine** joins same realm/federation | Future process; same principal conventions |
 
-Stages may ship independently; **options and resolution algorithm are designed for S2–S3 from the start**.
+**Default design target is S2–S5 for this repo.** S0 exists so unit tests and first-time toolchain builds do not hard-block on a KDC. Signals users should not plan on a permanent non-Kerberos workflow.
 
 ### 11.4 Summary table
 

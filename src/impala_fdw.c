@@ -19,16 +19,22 @@
 #include "access/reloptions.h"
 #include "catalog/pg_foreign_server.h"
 #include "catalog/pg_foreign_table.h"
+#include "catalog/pg_user_mapping.h"
 #include "commands/defrem.h"
 #include "executor/executor.h"
 #include "foreign/fdwapi.h"
 #include "foreign/foreign.h"
+#include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/planmain.h"
 #include "optimizer/restrictinfo.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/rel.h"
+
+#include "krb_util.h"
+#include "path_select.h"
 
 PG_MODULE_MAGIC;
 
@@ -36,9 +42,12 @@ PG_MODULE_MAGIC;
 #define OPTION_HOST "host"
 #define OPTION_PORT "port"
 #define OPTION_AUTH "auth"
+#define OPTION_KRB_REALM "krb_realm"
+#define OPTION_DEFAULT_ACCESS "default_access"
 /* Table options */
 #define OPTION_DATABASE "database"
 #define OPTION_TABLE "table"
+#define OPTION_ACCESS "access"
 
 /*
  * FDW-private state for a scan (placeholder).
@@ -49,6 +58,12 @@ typedef struct ImpalaFdwScanState
 	int			port;
 	char	   *database;
 	char	   *table;
+	char	   *auth;
+	char	   *krb_realm;
+	char	   *access;
+	char	   *principal;
+	const char *shape_id;
+	ImpalaFdwAccessMethod method;
 } ImpalaFdwScanState;
 
 /* Forward declarations */
@@ -121,22 +136,38 @@ impala_fdw_validator(PG_FUNCTION_ARGS)
 		{
 			if (strcmp(name, OPTION_HOST) != 0 &&
 				strcmp(name, OPTION_PORT) != 0 &&
-				strcmp(name, OPTION_AUTH) != 0)
+				strcmp(name, OPTION_AUTH) != 0 &&
+				strcmp(name, OPTION_KRB_REALM) != 0 &&
+				strcmp(name, "krb_service") != 0 &&
+				strcmp(name, "krb_host") != 0 &&
+				strcmp(name, "kudu_masters") != 0 &&
+				strcmp(name, OPTION_DEFAULT_ACCESS) != 0)
 				ereport(ERROR,
 						(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
 						 errmsg("invalid option \"%s\" for Impala server", name),
-						 errhint("Valid options are: host, port, auth.")));
+						 errhint("Valid options: host, port, auth, krb_realm, krb_service, krb_host, kudu_masters, default_access.")));
 		}
 		else if (catalog == ForeignTableRelationId)
 		{
 			if (strcmp(name, OPTION_DATABASE) != 0 &&
-				strcmp(name, OPTION_TABLE) != 0)
+				strcmp(name, OPTION_TABLE) != 0 &&
+				strcmp(name, OPTION_ACCESS) != 0 &&
+				strcmp(name, "kudu_table") != 0 &&
+				strcmp(name, "kudu_column") != 0)
 				ereport(ERROR,
 						(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
 						 errmsg("invalid option \"%s\" for Impala foreign table", name),
-						 errhint("Valid options are: database, table.")));
+						 errhint("Valid options: database, table, access, kudu_table, kudu_column.")));
 		}
-		/* UserMappingRelationId: no options yet */
+		else if (catalog == UserMappingRelationId)
+		{
+			if (strcmp(name, "principal") != 0 &&
+				strcmp(name, "keytab") != 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+						 errmsg("invalid option \"%s\" for user mapping", name),
+						 errhint("Valid options: principal, keytab.")));
+		}
 	}
 
 	PG_RETURN_VOID();
@@ -209,18 +240,24 @@ impalaBeginForeignScan(ForeignScanState *node, int eflags)
 	ForeignScan *fsplan = (ForeignScan *) node->ss.ps.plan;
 	ForeignTable *table;
 	ForeignServer *server;
+	UserMapping *mapping;
 	ImpalaFdwScanState *festate;
 	char	   *port_str;
+	char	   *forced;
+	char	   *map_principal = NULL;
 	List	   *options = NIL;
+	List	   *map_opts = NIL;
+	bool		auth_kerberos;
 
 	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
 		return;
 
 	table = GetForeignTable(RelationGetRelid(node->ss.ss_currentRelation));
 	server = GetForeignServer(table->serverid);
+	mapping = GetUserMapping(GetUserId(), table->serverid);
 
-	options = list_concat(options, list_copy(server->options));
-	options = list_concat(options, list_copy(table->options));
+	options = list_concat(list_copy(server->options), list_copy(table->options));
+	map_opts = list_copy(mapping->options);
 
 	festate = (ImpalaFdwScanState *) palloc0(sizeof(ImpalaFdwScanState));
 	festate->host = get_option_value(options, OPTION_HOST);
@@ -232,23 +269,45 @@ impalaBeginForeignScan(ForeignScanState *node, int eflags)
 	if (festate->database == NULL)
 		festate->database = "default";
 	festate->table = get_option_value(options, OPTION_TABLE);
+	festate->auth = get_option_value(options, OPTION_AUTH);
+	if (festate->auth == NULL)
+		festate->auth = "kerberos";		/* signals default; nosasl for CI only */
+	festate->krb_realm = get_option_value(options, OPTION_KRB_REALM);
+	festate->access = get_option_value(options, OPTION_ACCESS);
+	if (festate->access == NULL)
+		festate->access = get_option_value(options, OPTION_DEFAULT_ACCESS);
+	if (festate->access == NULL)
+		festate->access = "auto";
+
+	map_principal = get_option_value(map_opts, "principal");
+	auth_kerberos = (pg_strcasecmp(festate->auth, "nosasl") != 0);
+	festate->principal = impala_fdw_resolve_principal(map_principal,
+													  festate->krb_realm,
+													  auth_kerberos);
+
+	forced = festate->access;
+	impala_fdw_select_path(forced, false, false,
+						   &festate->method, &festate->shape_id);
 
 	node->fdw_state = (void *) festate;
 
 	/*
-	 * HS2 client not yet wired: fail clearly on first real scan.
-	 * EXPLAIN-only path returns above.
+	 * HS2 / Kudu clients not yet wired: fail with path + identity context.
 	 */
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("impala_fdw: Impala HS2 scan not implemented yet"),
-			 errdetail("Would scan Kudu-backed table %s.%s via HS2 %s:%d",
+			 errmsg("impala_fdw: remote scan not implemented yet (phase 1 HS2 / phase 3 Kudu)"),
+			 errdetail("table %s.%s method=%s shape=%s auth=%s principal=%s via %s:%d",
 					   festate->database,
 					   festate->table ? festate->table : "(unset)",
+					   festate->method == IMPALA_FDW_ACCESS_KUDU_SCAN ? "kudu_scan" : "impala_sql",
+					   festate->shape_id,
+					   festate->auth,
+					   festate->principal ? festate->principal : "(none)",
 					   festate->host,
 					   festate->port),
-			 errhint("Wire the HS2 client in IterateForeignScan; only Kudu storage is in scope. "
-					 "Signals devenv HS2 is localhost:21050.")));
+			 errhint("Signals expects Kerberos for real users (auth=kerberos). "
+					 "Wire C/C++ HS2 (impala_sql) or libkudu_client (kudu_scan).")));
 
 	(void) fsplan;
 }
