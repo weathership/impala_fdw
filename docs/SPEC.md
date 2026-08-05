@@ -551,3 +551,4 @@ components/impala_fdw/
 | 0.1 | 2026-08-05 | Initial binding spec: dual path, governance catalog, Kudu-only |
 | 0.2 | 2026-08-05 | C/C++ binding; single-tenant; Kerberos first-class; PG RLS patterns |
 | 0.3 | 2026-08-05 | Postgres GSSAPI + same principal to Impala/Kudu (end-to-end identity) |
+| 0.4 | 2026-08-05 | Realm includes env segment: `DEV.VISTA.ZNDX.ORG`; PG role remains short primary |
