@@ -12,3 +12,6 @@ tmp_check/
 *.log
 *~
 .DS_Store
+tools/hs2_smoke
+# gen-cpp is committed for reproducible builds without thriftc;
+# remove from gitignore if regenerating oftengen-cpp/*skeleton*

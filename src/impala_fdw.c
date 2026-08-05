@@ -33,8 +33,17 @@
 #include "utils/builtins.h"
 #include "utils/rel.h"
 
+#include "exec_impala.h"
 #include "krb_util.h"
 #include "path_select.h"
+
+#include "utils/lsyscache.h"
+#include "utils/syscache.h"
+#include "catalog/pg_type.h"
+#include "executor/tuptable.h"
+#include "access/htup_details.h"
+#include "utils/memutils.h"
+#include "utils/ruleutils.h"
 
 PG_MODULE_MAGIC;
 
@@ -64,6 +73,11 @@ typedef struct ImpalaFdwScanState
 	char	   *principal;
 	const char *shape_id;
 	ImpalaFdwAccessMethod method;
+	/* HS2 */
+	ImpalaHs2Session *hs2;
+	ImpalaHs2Result *result;
+	List	   *retrieved_attrs;	/* 1-based attnums */
+	char	   *sql;
 } ImpalaFdwScanState;
 
 /* Forward declarations */
@@ -291,23 +305,74 @@ impalaBeginForeignScan(ForeignScanState *node, int eflags)
 
 	node->fdw_state = (void *) festate;
 
-	/*
-	 * HS2 / Kudu clients not yet wired: fail with path + identity context.
-	 */
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("impala_fdw: remote scan not implemented yet (phase 1 HS2 / phase 3 Kudu)"),
-			 errdetail("table %s.%s method=%s shape=%s auth=%s principal=%s via %s:%d",
-					   festate->database,
-					   festate->table ? festate->table : "(unset)",
-					   festate->method == IMPALA_FDW_ACCESS_KUDU_SCAN ? "kudu_scan" : "impala_sql",
-					   festate->shape_id,
-					   festate->auth,
-					   festate->principal ? festate->principal : "(none)",
-					   festate->host,
-					   festate->port),
-			 errhint("Signals expects Kerberos for real users (auth=kerberos). "
-					 "Wire C/C++ HS2 (impala_sql) or libkudu_client (kudu_scan).")));
+	/* Kudu path not yet implemented — fall back to HS2 with notice */
+	if (festate->method == IMPALA_FDW_ACCESS_KUDU_SCAN)
+	{
+		elog(DEBUG1,
+			 "impala_fdw: kudu_scan not implemented; using impala_sql for %s.%s",
+			 festate->database,
+			 festate->table ? festate->table : "?");
+		festate->method = IMPALA_FDW_ACCESS_IMPALA_SQL;
+	}
+
+	/* Build simple SELECT list from foreign table attrs */
+	{
+		Relation	rel = node->ss.ss_currentRelation;
+		TupleDesc	tupdesc = RelationGetDescr(rel);
+		StringInfoData buf;
+		int			i;
+		bool		first = true;
+
+		initStringInfo(&buf);
+		appendStringInfoString(&buf, "SELECT ");
+		festate->retrieved_attrs = NIL;
+		for (i = 0; i < tupdesc->natts; i++)
+		{
+			Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+
+			if (attr->attisdropped)
+				continue;
+			if (!first)
+				appendStringInfoString(&buf, ", ");
+			first = false;
+			appendStringInfo(&buf, "%s", quote_identifier(NameStr(attr->attname)));
+			festate->retrieved_attrs =
+				lappend_int(festate->retrieved_attrs, i + 1);
+		}
+		if (first)
+			appendStringInfoString(&buf, "*");
+		appendStringInfo(&buf, " FROM %s.%s",
+						 quote_identifier(festate->database),
+						 festate->table ? quote_identifier(festate->table) : "dual");
+		festate->sql = buf.data;
+	}
+
+	{
+		char	   *err = NULL;
+
+		festate->hs2 = impala_hs2_connect(festate->host, festate->port,
+										  festate->auth,
+										  festate->principal,
+										  festate->database, &err);
+		if (festate->hs2 == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
+					 errmsg("impala_fdw: HS2 connect failed: %s",
+							err ? err : "unknown"),
+					 errdetail("host=%s port=%d auth=%s principal=%s",
+							   festate->host, festate->port, festate->auth,
+							   festate->principal ? festate->principal : "(none)"),
+					 errhint("For phase-1 dep validation use auth=nosasl. "
+							 "Kerberos GSSAPI is next once HS2 thrift is proven.")));
+
+		festate->result = impala_hs2_execute(festate->hs2, festate->sql, &err);
+		if (festate->result == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_ERROR),
+					 errmsg("impala_fdw: HS2 execute failed: %s",
+							err ? err : "unknown"),
+					 errdetail("sql: %s", festate->sql)));
+	}
 
 	(void) fsplan;
 }
@@ -315,18 +380,100 @@ impalaBeginForeignScan(ForeignScanState *node, int eflags)
 static TupleTableSlot *
 impalaIterateForeignScan(ForeignScanState *node)
 {
-	/* Unreachable until BeginForeignScan succeeds */
-	return ExecClearTuple(node->ss.ss_ScanTupleSlot);
+	ImpalaFdwScanState *festate = (ImpalaFdwScanState *) node->fdw_state;
+	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
+	char	  **values = NULL;
+	bool	   *nulls = NULL;
+	int			nfields = 0;
+	char	   *err = NULL;
+	int			rc;
+	TupleDesc	tupdesc;
+	int			i;
+	Datum	   *dvalues;
+	bool	   *dnulls;
+	ListCell   *lc;
+	int			atti;
+
+	ExecClearTuple(slot);
+	if (festate == NULL || festate->result == NULL)
+		return slot;
+
+	rc = impala_hs2_fetch_row(festate->result, &values, &nfields, &nulls, &err);
+	if (rc < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_ERROR),
+				 errmsg("impala_fdw: HS2 fetch failed: %s", err ? err : "?")));
+	if (rc == 0)
+		return slot;
+
+	tupdesc = slot->tts_tupleDescriptor;
+	dvalues = (Datum *) palloc0(tupdesc->natts * sizeof(Datum));
+	dnulls = (bool *) palloc(tupdesc->natts * sizeof(bool));
+	for (i = 0; i < tupdesc->natts; i++)
+		dnulls[i] = true;
+
+	atti = 0;
+	foreach(lc, festate->retrieved_attrs)
+	{
+		int			attno = lfirst_int(lc) - 1;
+		Form_pg_attribute attr;
+		Oid			typinput;
+		Oid			typioparam;
+
+		if (atti >= nfields)
+			break;
+		attr = TupleDescAttr(tupdesc, attno);
+		if (nulls && nulls[atti])
+		{
+			dnulls[attno] = true;
+		}
+		else if (values[atti] == NULL)
+		{
+			dnulls[attno] = true;
+		}
+		else
+		{
+			getTypeInputInfo(attr->atttypid, &typinput, &typioparam);
+			dvalues[attno] = OidInputFunctionCall(typinput, values[atti],
+												  typioparam, attr->atttypmod);
+			dnulls[attno] = false;
+		}
+		atti++;
+	}
+
+	impala_hs2_free_row(values, nulls, nfields);
+	return ExecStoreHeapTuple(
+		heap_form_tuple(tupdesc, dvalues, dnulls), slot, false);
 }
 
 static void
 impalaReScanForeignScan(ForeignScanState *node)
 {
-	/* no-op scaffold */
+	ImpalaFdwScanState *festate = (ImpalaFdwScanState *) node->fdw_state;
+	char	   *err = NULL;
+
+	if (festate == NULL || festate->hs2 == NULL || festate->sql == NULL)
+		return;
+	if (festate->result)
+		impala_hs2_close_result(festate->result);
+	festate->result = impala_hs2_execute(festate->hs2, festate->sql, &err);
+	if (festate->result == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_ERROR),
+				 errmsg("impala_fdw: HS2 re-execute failed: %s",
+						err ? err : "?")));
 }
 
 static void
 impalaEndForeignScan(ForeignScanState *node)
 {
+	ImpalaFdwScanState *festate = (ImpalaFdwScanState *) node->fdw_state;
+
+	if (festate == NULL)
+		return;
+	if (festate->result)
+		impala_hs2_close_result(festate->result);
+	if (festate->hs2)
+		impala_hs2_close(festate->hs2);
 	node->fdw_state = NULL;
 }

@@ -478,7 +478,7 @@ Java remains acceptable for **out-of-process** tooling (tests, Impala FE), not f
 | **5** | IMPORT FOREIGN SCHEMA (kudu_only) | Import default DB Kudu tables |
 | **6** | RLS regression suite + security-barrier view recipes | Documented patterns; CI policies deny/allow |
 
-Phase 1 may ship with `nosasl` only if 1b/1c are scheduled immediately after; end-to-end Kerberos identity is product intent, not optional polish.
+Phase 1 establishes the thrift/boost dep stack with **NOSASL** so HS2 can be proven before PG GSSAPI. Phase 1b/1c restore Kerberos-first product path; signals users still expect Kerberos for real work.
 
 ## 15. Testing strategy
 
