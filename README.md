@@ -17,6 +17,12 @@ join the hot data plane without copying bulk data into Postgres.
 Impala is the **query frontend** (HS2); Kudu is the only **storage backend** we
 need to support for foreign tables.
 
+## Specification
+
+**Binding design:** [docs/SPEC.md](docs/SPEC.md) — dual access paths
+(`impala_sql` + `kudu_scan`), governance op catalog, Kudu-only storage,
+phased implementation.
+
 ## Status
 
 Scaffold / MVP. Builds as a PostgreSQL 16 extension; foreign table scans are

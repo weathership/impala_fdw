@@ -1,48 +1,38 @@
 # impala_fdw design notes
 
-## Role in signals-360
+**Canonical specification:** [SPEC.md](./SPEC.md) (binding intent for implementation).
+
+This file is a short orientation; do not diverge from SPEC.md.
+
+## One-liner
+
+PostgreSQL FDW for **Kudu-only** tables: **Impala HS2 by default** (SQL-shaped,
+Cloudera-aligned), with **direct Kudu scans** for the closed Atlas / Ranger /
+AGE / sigint governance algebra.
+
+## Topology
 
 ```
 PostgreSQL (:5455)
-  ├─ AGE graph (Atlas entities, atlas_graph)
-  ├─ signals_catalog (Impala HMS-free registry)
-  └─ impala_fdw ──HS2──► Impala (:21050) ──► Kudu only (:7051)
+  ├─ AGE / Atlas graph
+  ├─ signals_catalog
+  └─ impala_fdw
+        ├─ impala_sql ──HS2──► Impala ──► Kudu
+        └─ kudu_scan  ───────► Kudu
 ```
 
-Governance and graph queries stay in Postgres; **hot-tier bulk data stays in
-Kudu**, addressed only through Impala HS2. FDW is complementary to Atlas
-(metadata), not a replacement.
+## Storage
 
-## Storage scope (binding)
+**Kudu only.** No Iceberg / HDFS / other Impala formats in v1.
 
-**v1 target: Kudu-backed Impala tables only.**
+## Status
 
-- Foreign tables correspond 1:1 to Impala tables whose storage handler is Kudu.
-- No requirement to support Iceberg, HDFS/Parquet, or other Impala table types.
-- Optional later: Kudu client bypass for simple PK lookups; not the default path.
+| Phase | State |
+|-------|--------|
+| 0 Scaffold | Done (extension loads; scan errors clearly) |
+| 1+ HS2 / Kudu paths | Per SPEC.md §14 |
 
-This keeps the FDW contract small: HS2 SQL against tables that already exist on
-the signals Kudu cluster.
+## Non-goals (summary)
 
-## Protocol
-
-- **HiveServer2** thrift (same as Impala HS2 / JDBC) — not a native Kudu wire
-  protocol for the first cut.
-- Auth modes: `nosasl` (devenv default), later `kerberos` with
-  `impala/tinybox.dev.vista.zndx.org@VISTA.ZNDX.ORG`.
-
-## Implementation phases
-
-1. **Scaffold** — extension, options validator, planner hooks, clear error on scan.
-2. **HS2 client** — thrift or thin bridge; `SELECT *` from Kudu-backed tables.
-3. **Predicate pushdown** — remote quals in `GetForeignPlan` (push what Kudu/Impala can use).
-4. **IMPORT FOREIGN SCHEMA** — map Impala `SHOW TABLES` / `DESCRIBE`, filter or
-   document Kudu-only tables.
-5. **Kerberos** — keytab / ticket cache from signals devenv KDC.
-
-## Non-goals
-
-- Iceberg / multi-format Impala foreign tables.
-- Writing DML to Impala/Kudu in v0 (read-only scans first).
-- Replacing the Python catalog bridge or Atlas REST tagging path.
-- Standing in for Ranger (authorization stays on Impala/Ranger, not the FDW).
+No HMS, no standalone HiveServer2, no DML in v0, no multi-format storage,
+no replacing Atlas/Ranger engines.
