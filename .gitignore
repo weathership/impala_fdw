@@ -1,0 +1,14 @@
+*.o
+*.so
+*.bc
+*.dll
+*.dylib
+*.a
+results/
+regression.diffs
+regression.out
+tmp_check/
+.deps/
+*.log
+*~
+.DS_Store
