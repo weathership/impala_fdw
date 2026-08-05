@@ -388,6 +388,7 @@ Both `impala_sql` and `kudu_scan` **must use the same resolved principal** for a
 | `impala_sql` | HS2 client as **resolved client principal** → service `impala/<krb_host>@REALM` |
 | `kudu_scan` | `libkudu_client` as **same client principal** → Kudu SPNs |
 | Devenv | Realm `DEV.VISTA.ZNDX.ORG`, host `tinybox.dev.vista.zndx.org`; `KRB5_CONFIG` / `KRB5CCNAME` |
+| SecretSpec | Keytab **paths** via `SIGNALS_KRB_USER_KEYTAB` / service keytab vars (`secretspec.toml`); realm/host remain non-secret devenv env |
 
 #### 11.3.3 SET ROLE and identity
 
@@ -552,3 +553,4 @@ components/impala_fdw/
 | 0.2 | 2026-08-05 | C/C++ binding; single-tenant; Kerberos first-class; PG RLS patterns |
 | 0.3 | 2026-08-05 | Postgres GSSAPI + same principal to Impala/Kudu (end-to-end identity) |
 | 0.4 | 2026-08-05 | Realm includes env segment: `DEV.VISTA.ZNDX.ORG`; PG role remains short primary |
+| 0.4.1 | 2026-08-05 | SecretSpec keytab paths for credentials; devenv day-one integration |
