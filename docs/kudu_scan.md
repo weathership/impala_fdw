@@ -1035,7 +1035,7 @@ Ordered, independently reviewable PRs.
 
 | Sub-PR | Scope | Exit |
 |--------|--------|------|
-| **K5a** | Document + devenv: enable Kudu RPC Kerberos (flags, keytabs, SPNs `kudu/tinybox…@DEV.VISTA.ZNDX.ORG`); kinit `signals`; smoke `kudu cluster ksck` with auth | Kudu rejects unauthenticated clients; lab ticket works |
+| **K5a** | Devenv: `SIGNALS_KUDU_KERBEROS=1` wires master/tserver `--keytab_file` + `rpc_authentication=required`; keytab from `signals:kdc-init`; smoke `scripts/kudu_kerberos_smoke.sh` | **Landed (2026-08-08):** keytab/SPN checks green; MODE default 0 keeps nosasl stack; MODE=1 requires restart + K5b for clients |
 | **K5b** | `exec_kudu`: if `auth=kerberos`, `builder.sasl_protocol_name("kudu")`, `require_authentication(true)`; respect `KRB5CCNAME` / `SIGNALS_KRB_USER_KEYTAB`; expand client cache key | Forced `kudu_scan` as `signals@…` succeeds; wrong ccache fails closed |
 | **K5c** | Wire principal from `impala_fdw_resolve_principal` into open path; EXPLAIN shows principal (redact realm optional); GUC `impala_fdw.log_path_choice` includes auth | Audit trail: same principal string for kudu as would be used for HS2 |
 | **K5d** | (Optional same stack) Implement HS2 Kerberos (S2) so dual-path identity is complete | `impala_sql` + `kudu_scan` both GSS as session principal |
