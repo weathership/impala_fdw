@@ -254,7 +254,7 @@ Input: RelOptInfo / ForeignScan (tlist, quals, limit, table options)
 - Attribute op Const for op in `=`, `<>`, `<`, `<=`, `>`, `>=`
 - `IS NULL` / `IS NOT NULL`
 - AND of pushable clauses
-- `IN (const list)` (optional phase 2)
+- **`IN (const list)` and `= ANY(array)`** — **phase-1 exit criteria** (Atlas adjacency frontier; both plan shapes required in tests)
 - Column projection (tlist subset)
 
 ### 8.2 Not pushed (evaluate in Postgres or require impala_sql)
@@ -468,11 +468,12 @@ Java remains acceptable for **out-of-process** tooling (tests, Impala FE), not f
 |-------|-------------|---------------|
 | **0** | Scaffold | Extension loads; validator |
 | **1** | **C/C++ HS2 thrift** + foreign scan (`nosasl`) | OpenSession/Execute/Fetch; FDW SELECT; `tools/hs2_smoke` |
+| **1a** | **Projection + PK/eq + IN + ANY pushdown** + EXPLAIN ShapeId | Atlas freeze; frontier loop viable; see `docs/current/src/architecture/atlas-kudu-outbox.md` |
 | **1b** | Kerberos + **HS2 GSSAPI/SASL** | `auth=kerberos` with signals KDC |
 | **1c** | **Postgres GSSAPI** (`pg_hba`, postgres SPN, `pg_ident`) + principal resolution | GSS login as `signals@…` → role `signals` |
-| **2** | Pushdown + LIMIT + EXPLAIN path label | Predicate push; EXPLAIN shows impala_sql |
+| **2** | LIMIT always + residual join push polish | EXPLAIN shows impala_sql; sample shapes |
 | **2b** | **Same principal** PG session → HS2 (S2) | Audit: outbound principal equals GSS identity |
-| **3** | **C++ libkudu_client** + `gov.pk_lookup` + `gov.column_sample` | Equivalence tests vs HS2; EXPLAIN shows kudu_scan |
+| **3** | **C++ libkudu_client** + `gov.pk_lookup` / IN / sample — **see [kudu_scan.md](./kudu_scan.md)** | Equivalence vs HS2; frontier hop_ms ≪ 100ms; EXPLAIN `kudu_scan` |
 | **3b** | Same principal on **Kudu client** path (S3) | `kudu_scan` with secured cluster as session user |
 | **4** | Full shape catalog + selector GUCs + fallback | All §6 shapes classified; BDD in signals |
 | **5** | IMPORT FOREIGN SCHEMA (kudu_only) | Import default DB Kudu tables |
@@ -500,10 +501,11 @@ Fixture: small Kudu table `gov_fdw_probe(id INT PK, name STRING, ts BIGINT)` loa
 | Component | Interaction |
 |-----------|-------------|
 | `signals_catalog` | Optional source of table list / FQ names for IMPORT |
-| Atlas / AGE | Graph stays in PG; FDW supplies row/sample data for enrichment |
+| Atlas / AGE | Graph stays in PG (SoR); typed Kudu projections + FDW for scale reads — freeze `211412_atlas-kudu-projection-freeze.md` |
+| Atlas projections | DDL `config/atlas/kudu_projections.sql`; FT `kudu_projections_fdw.sql`; outbox `architecture/atlas-kudu-outbox.md` |
 | sigint sampler | Prefer `gov.column_sample` over ad-hoc HS2 in Python long-term |
 | Ranger | Policy metadata in Ranger/Atlas; value checks may use FDW reads |
-| devenv | `impala-fdw:build`; PG 16; HS2 :21050; Kudu :7051 |
+| devenv | `impala-fdw:build`; PG 16; HS2 :21050; Kudu :7051; `just atlas-kudu-projections-seed` |
 
 ## 17. Directory layout (target)
 

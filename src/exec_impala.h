@@ -49,6 +49,15 @@ void impala_hs2_free_row(char **values, bool *nulls, int nfields);
 void impala_hs2_close_result(ImpalaHs2Result *result);
 void impala_hs2_close(ImpalaHs2Session *session);
 
+/*
+ * Interrupt hook (F7 / N3): default false in exec_impala.cpp.
+ * impala_fdw _PG_init registers a backend-aware implementation.
+ * Standalone tools (hs2-smoke) link without impala_fdw.o.
+ */
+typedef bool (*ImpalaFdwInterruptCheckFn)(void);
+void ImpalaFdwSetInterruptCheck(ImpalaFdwInterruptCheckFn fn);
+bool ImpalaFdwInterruptPending(void);
+
 #ifdef __cplusplus
 }
 #endif

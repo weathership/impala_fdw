@@ -32,8 +32,12 @@ PostgreSQL (:5455)
 
 | Phase | State |
 |-------|--------|
-| 0 Scaffold | Done (extension loads; scan errors clearly) |
-| 1+ HS2 / Kudu paths | Per SPEC.md §14 |
+| 0 Scaffold | Done |
+| 1a HS2 pushdown (proj/IN/ANY/EXPLAIN) | Done |
+| **3 kudu_scan (libkudu_client)** | **Lab-ready (K0–K4 + chkpt-02)** — [kudu_scan.md](./kudu_scan.md); **PR-K5** Kerberos plan verified (K5a–K5e) |
+| Kerberos / pool / TC | Later (K5 after latency proof) |
+
+Atlas projections + frontier bench (~2.5s/hop HS2 floor) drive **kudu_scan** priority over more HS2 pooling.
 
 ## Non-goals (summary)
 

@@ -16,11 +16,13 @@
 
 #include "TCLIService.h"
 
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace apache::thrift;
@@ -44,12 +46,31 @@ struct ImpalaHs2Result
 	/* columnar batch buffer */
 	std::vector<std::vector<std::string>> col_values;
 	std::vector<std::string> col_nulls;		/* bitmaps */
+	/* F5: per-column binary from GetResultSetMetadata (not content sniffing) */
+	std::vector<bool> col_is_binary;
 	size_t nrows;
 	size_t next_row;
 	size_t nfields;
 	bool exhausted;
 	bool has_result_set;
 };
+
+/* N3: function-pointer hook — default no interrupt (hs2-smoke safe). */
+static ImpalaFdwInterruptCheckFn g_interrupt_check = NULL;
+
+extern "C" void
+ImpalaFdwSetInterruptCheck(ImpalaFdwInterruptCheckFn fn)
+{
+	g_interrupt_check = fn;
+}
+
+extern "C" bool
+ImpalaFdwInterruptPending(void)
+{
+	if (g_interrupt_check)
+		return g_interrupt_check();
+	return false;
+}
 
 static char *
 dup_err(const std::string &s)
@@ -109,15 +130,51 @@ column_len(const TColumn &c)
 	return 0;
 }
 
+/* Postgres bytea hex input: \xDEADBEEF (safe with embedded NULs). */
+static std::string
+bytes_to_pg_hex(const std::string &raw)
+{
+	static const char *H = "0123456789abcdef";
+	std::string out;
+	out.reserve(2 + raw.size() * 2);
+	out.push_back('\\');
+	out.push_back('x');
+	for (unsigned char b : raw)
+	{
+		out.push_back(H[b >> 4]);
+		out.push_back(H[b & 0x0f]);
+	}
+	return out;
+}
+
 static void
 column_to_strings(const TColumn &c, std::vector<std::string> *out,
-				  std::string *nulls)
+				  std::string *nulls, bool is_binary)
 {
 	out->clear();
+	/*
+	 * BINARY: prefer binaryVal thrift field; else stringVal with metadata
+	 * is_binary (F5 — no content-sniffing batch hex of text columns).
+	 */
+	if (c.__isset.binaryVal)
+	{
+		*nulls = c.binaryVal.nulls;
+		out->reserve(c.binaryVal.values.size());
+		for (const auto &v : c.binaryVal.values)
+			out->push_back(bytes_to_pg_hex(v));
+		return;
+	}
 	if (c.__isset.stringVal)
 	{
-		*out = c.stringVal.values;
 		*nulls = c.stringVal.nulls;
+		if (is_binary)
+		{
+			out->reserve(c.stringVal.values.size());
+			for (const auto &v : c.stringVal.values)
+				out->push_back(bytes_to_pg_hex(v));
+		}
+		else
+			*out = c.stringVal.values;
 		return;
 	}
 	if (c.__isset.boolVal)
@@ -160,12 +217,6 @@ column_to_strings(const TColumn &c, std::vector<std::string> *out,
 		*nulls = c.doubleVal.nulls;
 		for (auto v : c.doubleVal.values)
 			out->push_back(std::to_string(v));
-		return;
-	}
-	if (c.__isset.binaryVal)
-	{
-		*nulls = c.binaryVal.nulls;
-		*out = c.binaryVal.values;
 		return;
 	}
 }
@@ -212,7 +263,10 @@ load_batch(ImpalaHs2Result *r, std::string *err)
 		size_t n = column_len(rs.columns[0]);
 		for (size_t c = 0; c < r->nfields; c++)
 		{
-			column_to_strings(rs.columns[c], &r->col_values[c], &r->col_nulls[c]);
+			bool is_bin = (c < r->col_is_binary.size() && r->col_is_binary[c]);
+
+			column_to_strings(rs.columns[c], &r->col_values[c],
+							  &r->col_nulls[c], is_bin);
 			if (r->col_values[c].size() > n)
 				n = r->col_values[c].size();
 		}
@@ -336,6 +390,112 @@ impala_hs2_connect(const char *host, int port, const char *auth,
 	}
 }
 
+/*
+ * Wait until HS2 operation reaches a terminal state. Impala may return from
+ * ExecuteStatement before DML/DDL fragments finish even with runAsync=false;
+ * closing the handle early cancels the query (Query Status: Cancelled).
+ */
+static int
+wait_operation_complete(ImpalaHs2Session *session, const TOperationHandle &op,
+						std::string *err)
+{
+	const auto deadline =
+		std::chrono::steady_clock::now() + std::chrono::seconds(120);
+	for (;;)
+	{
+		/* F7: observe PG cancel without longjmp across C++ frames */
+		if (ImpalaFdwInterruptPending())
+		{
+			if (err)
+				*err = "GetOperationStatus: query cancel requested";
+			return -1;
+		}
+
+		TGetOperationStatusReq sreq;
+		sreq.operationHandle = op;
+		TGetOperationStatusResp sresp;
+		try
+		{
+			session->client->GetOperationStatus(sresp, sreq);
+		}
+		catch (const TException &ex)
+		{
+			if (err)
+				*err = std::string("GetOperationStatus: ") + ex.what();
+			return -1;
+		}
+		if (!status_ok(sresp.status, err))
+			return -1;
+
+		if (!sresp.__isset.operationState)
+		{
+			if (err)
+				*err = "GetOperationStatus: missing operationState";
+			return -1;
+		}
+
+		const TOperationState::type st = sresp.operationState;
+		if (st == TOperationState::FINISHED_STATE)
+			return 0;
+		if (st == TOperationState::CANCELED_STATE ||
+			st == TOperationState::CLOSED_STATE ||
+			st == TOperationState::ERROR_STATE ||
+			st == TOperationState::UKNOWN_STATE)
+		{
+			if (err)
+			{
+				std::ostringstream o;
+				o << "operation failed, state=" << (int)st;
+				if (sresp.__isset.errorMessage && !sresp.errorMessage.empty())
+					o << ": " << sresp.errorMessage;
+				*err = o.str();
+			}
+			return -1;
+		}
+		/* PENDING / RUNNING / INITIALIZED — keep polling */
+		if (std::chrono::steady_clock::now() >= deadline)
+		{
+			if (err)
+				*err = "GetOperationStatus: timed out waiting for completion";
+			return -1;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(20));
+	}
+}
+
+/* Load column type flags from TGetResultSetMetadata (BINARY → hex). */
+static void
+load_result_metadata(ImpalaHs2Result *r)
+{
+	r->col_is_binary.clear();
+	try
+	{
+		TGetResultSetMetadataReq mreq;
+		mreq.operationHandle = r->op;
+		TGetResultSetMetadataResp mresp;
+		r->session->client->GetResultSetMetadata(mresp, mreq);
+		std::string err;
+		if (!status_ok(mresp.status, &err) || !mresp.__isset.schema)
+			return;
+		const TTableSchema &schema = mresp.schema;
+		r->col_is_binary.resize(schema.columns.size(), false);
+		for (size_t i = 0; i < schema.columns.size(); i++)
+		{
+			const TTypeDesc &td = schema.columns[i].typeDesc;
+			if (td.types.empty())
+				continue;
+			const TTypeEntry &te = td.types[0];
+			if (te.__isset.primitiveEntry &&
+				te.primitiveEntry.type == TTypeId::BINARY_TYPE)
+				r->col_is_binary[i] = true;
+		}
+	}
+	catch (...)
+	{
+		/* leave col_is_binary empty → treat all as non-binary text */
+	}
+}
+
 ImpalaHs2Result *
 impala_hs2_execute(ImpalaHs2Session *session, const char *sql, char **errbuf)
 {
@@ -353,7 +513,8 @@ impala_hs2_execute(ImpalaHs2Session *session, const char *sql, char **errbuf)
 		TExecuteStatementReq ereq;
 		ereq.sessionHandle = session->session;
 		ereq.statement = sql;
-		ereq.__set_runAsync(false);
+		/* Async + explicit status poll so DML is not CloseOperation'd mid-flight. */
+		ereq.__set_runAsync(true);
 
 		TExecuteStatementResp eresp;
 		session->client->ExecuteStatement(eresp, ereq);
@@ -375,11 +536,21 @@ impala_hs2_execute(ImpalaHs2Session *session, const char *sql, char **errbuf)
 		r->exhausted = false;
 		r->has_result_set = eresp.operationHandle.hasResultSet;
 
+		if (wait_operation_complete(session, r->op, &err) < 0)
+		{
+			impala_hs2_close_result(r);
+			if (errbuf)
+				*errbuf = dup_err(err);
+			return NULL;
+		}
+
 		if (!r->has_result_set)
 		{
 			r->exhausted = true;
 			return r;
 		}
+
+		load_result_metadata(r);
 
 		if (load_batch(r, &err) < 0)
 		{

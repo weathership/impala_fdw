@@ -20,7 +20,8 @@ main(int argc, char **argv)
 		return 1;
 	}
 
-	ImpalaHs2Result *r = impala_hs2_execute(s, "SELECT 1 AS one", &err);
+	/* Impala treats bare `one` as reserved/odd; use a plain integer projection. */
+	ImpalaHs2Result *r = impala_hs2_execute(s, "SELECT 1", &err);
 	if (!r)
 	{
 		fprintf(stderr, "execute failed: %s\n", err ? err : "?");
