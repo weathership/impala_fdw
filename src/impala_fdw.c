@@ -96,6 +96,8 @@ typedef struct ImpalaFdwScanState
 	char	   *krb_realm;
 	char	   *access;
 	char	   *principal;
+	char	   *keytab;			/* USER MAPPING or SIGNALS_KRB_USER_KEYTAB */
+	char	   *ccache;			/* optional KRB5CCNAME override from mapping */
 	const char *shape_id;
 	ImpalaFdwAccessMethod method;
 	ImpalaHs2Session *hs2;
@@ -291,7 +293,8 @@ impala_fdw_validator(PG_FUNCTION_ARGS)
 		else if (catalog == UserMappingRelationId)
 		{
 			if (strcmp(name, "principal") != 0 &&
-				strcmp(name, "keytab") != 0)
+				strcmp(name, "keytab") != 0 &&
+				strcmp(name, "ccache") != 0)
 				ereport(ERROR,
 						(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
 						 errmsg("invalid option \"%s\" for user mapping", name)));
@@ -750,6 +753,18 @@ impala_begin_hs2_scan(ImpalaFdwScanState *festate,
 }
 
 #ifdef IMPALA_FDW_WITH_KUDU
+/* Build ImpalaKuduAuth from scan state (PR-K5b). Stack-local; borrowed strings. */
+static void
+impala_fill_kudu_auth(const ImpalaFdwScanState *festate, ImpalaKuduAuth *auth)
+{
+	memset(auth, 0, sizeof(*auth));
+	auth->mode = festate->auth ? festate->auth : "nosasl";
+	auth->principal = festate->principal;
+	auth->ccache = festate->ccache;
+	auth->keytab = festate->keytab;
+	auth->sasl_protocol = NULL;	/* default "kudu" in exec_kudu */
+}
+
 static bool
 impala_begin_kudu_scan(ImpalaFdwScanState *festate,
 					   Relation rel,
@@ -768,9 +783,12 @@ impala_begin_kudu_scan(ImpalaFdwScanState *festate,
 	int			npreds = 0;
 	bool		empty_result = false;
 	char	   *perr = NULL;
+	ImpalaKuduAuth kauth;
 
 	if (err_out)
 		*err_out = NULL;
+
+	impala_fill_kudu_auth(festate, &kauth);
 
 	/* Compile remote_exprs → Kudu pred IR (PR-K2) */
 	if (remote_exprs != NIL)
@@ -784,10 +802,10 @@ impala_begin_kudu_scan(ImpalaFdwScanState *festate,
 		}
 		if (empty_result)
 		{
-			/* Empty IN → no rows without RPC */
+			/* Empty IN → no rows without RPC (auth unused) */
 			festate->kudu = impala_kudu_scan_open(NULL, festate->kudu_table,
 												  NULL, 0, NULL, -1,
-												  limit_count, &err);
+												  limit_count, &kauth, &err);
 			if (festate->kudu == NULL)
 			{
 				if (err_out)
@@ -838,6 +856,7 @@ impala_begin_kudu_scan(ImpalaFdwScanState *festate,
 										  colnames, ncolumns,
 										  preds, npreds,
 										  limit_count,
+										  &kauth,
 										  &err);
 	/* pred IR may be discarded after open (deep-copied into Kudu) */
 	if (festate->kudu == NULL)
@@ -850,13 +869,15 @@ impala_begin_kudu_scan(ImpalaFdwScanState *festate,
 	}
 	festate->use_kudu = true;
 	elog(DEBUG1,
-		 "impala_fdw: shape=%s method=kudu_scan table=%s masters=%s cols=%d preds=%d limit=%ld",
+		 "impala_fdw: shape=%s method=kudu_scan table=%s masters=%s cols=%d preds=%d limit=%ld auth=%s principal=%s",
 		 festate->shape_id,
 		 festate->kudu_table,
 		 festate->kudu_masters,
 		 ncolumns,
 		 npreds,
-		 (long) limit_count);
+		 (long) limit_count,
+		 festate->auth ? festate->auth : "?",
+		 festate->principal ? festate->principal : "-");
 	return true;
 }
 #endif
@@ -1076,6 +1097,9 @@ impalaBeginForeignScan(ForeignScanState *node, int eflags)
 	ImpalaFdwScanState *festate;
 	char	   *port_str;
 	char	   *map_principal = NULL;
+	char	   *map_keytab = NULL;
+	char	   *map_ccache = NULL;
+	const char *env_keytab;
 	List	   *options = NIL;
 	List	   *map_opts = NIL;
 	bool		auth_kerberos;
@@ -1133,10 +1157,25 @@ impalaBeginForeignScan(ForeignScanState *node, int eflags)
 		festate->auth = "kerberos";
 	festate->krb_realm = get_option_value(options, OPTION_KRB_REALM);
 	map_principal = get_option_value(map_opts, "principal");
+	map_keytab = get_option_value(map_opts, "keytab");
+	map_ccache = get_option_value(map_opts, "ccache");
 	auth_kerberos = (pg_strcasecmp(festate->auth, "nosasl") != 0);
 	festate->principal = impala_fdw_resolve_principal(map_principal,
 													  festate->krb_realm,
 													  auth_kerberos);
+	/* PR-K5b: keytab from USER MAPPING, else SIGNALS_KRB_USER_KEYTAB */
+	env_keytab = impala_fdw_user_keytab_from_env();
+	if (map_keytab != NULL && map_keytab[0] != '\0')
+		festate->keytab = map_keytab;
+	else if (env_keytab != NULL)
+		festate->keytab = pstrdup(env_keytab);
+	else
+		festate->keytab = NULL;
+	/* optional ccache override; ambient KRB5CCNAME still used if NULL */
+	if (map_ccache != NULL && map_ccache[0] != '\0')
+		festate->ccache = map_ccache;
+	else
+		festate->ccache = NULL;
 
 	festate->kudu_masters = get_option_value(options, OPTION_KUDU_MASTERS);
 	if (festate->kudu_masters == NULL)
@@ -1166,10 +1205,12 @@ impalaBeginForeignScan(ForeignScanState *node, int eflags)
 
 	if (impala_fdw_log_path_choice)
 		elog(LOG,
-			 "impala_fdw: path shape=%s method=%s access=%s table=%s limit=%ld local_quals=%s",
+			 "impala_fdw: path shape=%s method=%s access=%s auth=%s principal=%s table=%s limit=%ld local_quals=%s",
 			 festate->shape_id,
 			 festate->method == IMPALA_FDW_ACCESS_KUDU_SCAN ? "kudu_scan" : "impala_sql",
 			 festate->access ? festate->access : "?",
+			 festate->auth ? festate->auth : "?",
+			 festate->principal ? festate->principal : "-",
 			 festate->kudu_table ? festate->kudu_table : "?",
 			 (long) limit_count,
 			 festate->has_local_quals ? "yes" : "no");
@@ -1508,16 +1549,26 @@ impalaExplainForeignScan(ForeignScanState *node, ExplainState *es)
 
 	{
 		List	   *options = NIL;
+		List	   *map_opts = NIL;
 		ForeignTable *ftable;
 		ForeignServer *server;
+		UserMapping *mapping;
 		char	   *masters;
 		char	   *kudu_opt;
 		char	   *resolved;
+		char	   *auth;
+		char	   *krb_realm;
+		char	   *map_principal;
+		char	   *principal;
+		bool		auth_kerberos;
+		ImpalaFdwScanState *festate = (ImpalaFdwScanState *) node->fdw_state;
 
 		ftable = GetForeignTable(RelationGetRelid(node->ss.ss_currentRelation));
 		server = GetForeignServer(ftable->serverid);
+		mapping = GetUserMapping(GetUserId(), ftable->serverid);
 		options = list_concat(list_copy(server->options),
 							  list_copy(ftable->options));
+		map_opts = list_copy(mapping->options);
 		masters = get_option_value(options, OPTION_KUDU_MASTERS);
 		if (masters == NULL)
 			masters = "127.0.0.1:7051";
@@ -1525,6 +1576,27 @@ impalaExplainForeignScan(ForeignScanState *node, ExplainState *es)
 		resolved = resolve_kudu_table_name(kudu_opt, database, table);
 		ExplainPropertyText("Impala KuduMasters", masters, es);
 		ExplainPropertyText("Impala KuduTable", resolved, es);
+
+		/* PR-K5c: outbound auth + principal for audit (same string as Begin) */
+		auth = get_option_value(options, OPTION_AUTH);
+		if (auth == NULL)
+			auth = "kerberos";
+		ExplainPropertyText("Impala Auth", auth, es);
+		if (festate != NULL && festate->principal != NULL)
+			principal = festate->principal;
+		else
+		{
+			krb_realm = get_option_value(options, OPTION_KRB_REALM);
+			map_principal = get_option_value(map_opts, "principal");
+			auth_kerberos = (pg_strcasecmp(auth, "nosasl") != 0);
+			principal = impala_fdw_resolve_principal(map_principal,
+													  krb_realm,
+													  auth_kerberos);
+		}
+		if (principal != NULL && principal[0] != '\0')
+			ExplainPropertyText("Impala Principal", principal, es);
+		else
+			ExplainPropertyText("Impala Principal", "-", es);
 	}
 
 	if (method == IMPALA_FDW_ACCESS_KUDU_SCAN)

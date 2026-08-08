@@ -130,7 +130,7 @@ Pull `libkudu_client` / `kudu_scan` **forward before** more HS2 pooling or TC ta
 | **KD2** | Product shape | One FDW, two executors (`exec_impala` + `exec_kudu`) | SPEC G4; shared types/options; no second extension |
 | **KD3** | Scope v1 | Read-only scan; closed predicates only | Match SPEC §6; DML is outbox/Impala |
 | **KD4** | Scanner model | `KuduScanner` + conjunct predicates (not scan tokens) | Serial Iterate; frontier hops tiny + HASH-pruned |
-| **KD5** | Client lifecycle | Per-backend process-global `KuduClient` cache by masters string; **not** shared across fork | Avoid per-hop open tax; parallel workers refuse kudu |
+| **KD5** | Client lifecycle | Per-backend process-global `KuduClient` cache by `masters\|mode\|principal\|ccache\|keytab`; **not** shared across fork or principals | Avoid per-hop open tax; parallel workers refuse kudu; no cross-user client reuse |
 | **KD6** | Table name | `kudu_table` option or `impala::` + `database` + `.` + `table` | HMS-free convention; no Impala DESCRIBE in v1 |
 | **KD7** | Edge key encoding (v1) | STRING hex32 for edges; BINARY for entity_flat/by_qn | HS2 parity on edges; schema DataType drives encode |
 | **KD8** | Fallback | auto → log + one HS2 retry on **transient** errors; forced `kudu_scan` → hard ERROR | SPEC §12–§13; NotFound still may fallback once but WARNING |
@@ -169,7 +169,7 @@ flowchart TB
   end
 
   subgraph Cache["Per-backend process-global"]
-    CC["KuduClient cache\nkey: masters string\nrefcount open scanners"]
+    CC["KuduClient cache\nkey: masters|mode|principal|ccache|keytab\nrefcount open scanners"]
   end
 
   EK --> CC
@@ -333,13 +333,20 @@ Do **not** permanently cache negative OpenTable results (no forever NotFound). O
 ### Client and table cache
 
 ```text
-Key:   canonical masters string (split on ',', trim, sort, rejoin)
-Value: { shared_ptr<KuduClient>, open_scanner_refcount }
+Key:   canon_masters|mode|principal|ccache|keytab
+       masters: split on ',', trim, sort, rejoin
+       mode: nosasl | kerberos
+       ccache: auth.ccache or ambient KRB5CCNAME when kerberos
+Value: { shared_ptr<KuduClient>, open_scanner_refcount, table map }
 Scope: process-global static map + std::mutex  (per PG backend process)
 Open:  KuduClientBuilder
          .master_server_addrs(...)
          .default_admin_operation_timeout(MonoDelta::FromSeconds(60))
          .default_rpc_timeout(MonoDelta::FromSeconds(30))
+         # PR-K5b when auth=kerberos:
+         .sasl_protocol_name(proto or "kudu")
+         .require_authentication(true)
+         # optional: keytab → kinit into ccache; setenv KRB5CCNAME for Build
          .Build(&client)
 Table: process-global name→shared_ptr<KuduTable> cache on successful OpenTable
        (from PR-K1); no permanent negative cache — refresh on next open / NotFound
@@ -707,16 +714,29 @@ typedef struct ImpalaKuduPred {
 } ImpalaKuduPred;
 
 /*
+ * PR-K5b auth (NULL or mode nosasl → unauthenticated lab client):
+ *   mode: "nosasl" | "kerberos"
+ *   principal / ccache / keytab: cache key + optional keytab→ccache kinit
+ *   sasl_protocol: NULL → "kudu"
  * limit: -1 = none.
  * err: on failure, malloc'd message (caller free); include masters+table when possible.
  * Pred IR is borrowed only for the duration of this call; deep-copied inside.
  */
+typedef struct ImpalaKuduAuth {
+  const char *mode;
+  const char *principal;
+  const char *ccache;
+  const char *keytab;
+  const char *sasl_protocol;
+} ImpalaKuduAuth;
+
 ImpalaKuduScan *impala_kudu_scan_open(
     const char *masters,
     const char *kudu_table,
     const char **columns, int ncolumns,
     const ImpalaKuduPred *preds, int npreds,
     int64_t limit,
+    const ImpalaKuduAuth *auth,
     char **err);
 
 /* 1 = row, 0 = done, -1 = error. values/nulls malloc'd; free with free_row. */
@@ -1036,8 +1056,8 @@ Ordered, independently reviewable PRs.
 | Sub-PR | Scope | Exit |
 |--------|--------|------|
 | **K5a** | Devenv: `SIGNALS_KUDU_KERBEROS=1` wires master/tserver `--keytab_file` + `rpc_authentication=required`; keytab from `signals:kdc-init`; smoke `scripts/kudu_kerberos_smoke.sh` | **Landed (2026-08-08):** keytab/SPN checks green; MODE default 0 keeps nosasl stack; MODE=1 requires restart + K5b for clients |
-| **K5b** | `exec_kudu`: if `auth=kerberos`, `builder.sasl_protocol_name("kudu")`, `require_authentication(true)`; respect `KRB5CCNAME` / `SIGNALS_KRB_USER_KEYTAB`; expand client cache key | Forced `kudu_scan` as `signals@…` succeeds; wrong ccache fails closed |
-| **K5c** | Wire principal from `impala_fdw_resolve_principal` into open path; EXPLAIN shows principal (redact realm optional); GUC `impala_fdw.log_path_choice` includes auth | Audit trail: same principal string for kudu as would be used for HS2 |
+| **K5b** | `exec_kudu`: if `auth=kerberos`, `builder.sasl_protocol_name("kudu")`, `require_authentication(true)`; respect `KRB5CCNAME` / `SIGNALS_KRB_USER_KEYTAB`; expand client cache key | **Landed (2026-08-08):** `ImpalaKuduAuth` + cache key `masters\|mode\|principal\|ccache\|keytab`; keytab→ccache kinit via libkrb5; nosasl regression green (forced kudu_scan + pred). Live MODE=1 success is K5c/smoke |
+| **K5c** | EXPLAIN shows principal (redact realm optional); GUC `impala_fdw.log_path_choice` includes auth; live MODE=1 `kudu_scan` as `signals@…` | **Landed (2026-08-08):** EXPLAIN `Impala Auth` + `Impala Principal`; `log_path_choice` includes auth/principal. Live MODE=1: restart Kudu with `SIGNALS_KUDU_KERBEROS=1`, kinit `signals@…`, forced kudu_scan |
 | **K5d** | (Optional same stack) Implement HS2 Kerberos (S2) so dual-path identity is complete | `impala_sql` + `kudu_scan` both GSS as session principal |
 | **K5e** | Tests: nosasl still works in CI; kerberos scenario behind `SIGNALS_BDD_TIER1` / manual devenv script | No regression of K0–K4 gates under nosasl |
 
@@ -1073,3 +1093,5 @@ Ordered, independently reviewable PRs.
 | 0.2.6 | 2026-08-07 | **Checkpoint-02**: N1 LIMIT under agg/sort/distinct; N2 multiset gate; N3 interrupt hook for hs2-smoke; N4 warm cache ~0.5ms; allowlist eq/IN-only |
 | 0.2.7 | 2026-08-07 | **PR-K5 plan verified** against code/headers/SPEC §11.3; staged K5a–K5e; yunikorn-core submodule noted out-of-band |
 | 0.2.8 | 2026-08-08 | **K5a landed** in devenv: SIGNALS_KUDU_KERBEROS, kudu keytab flags, signals:kudu-kerberos-smoke |
+| 0.2.9 | 2026-08-08 | **K5b landed**: `ImpalaKuduAuth` on open; SASL builder when auth≠nosasl; client cache keyed by masters+mode+principal+ccache+keytab; optional keytab kinit; USER MAPPING `ccache`/`keytab` + `SIGNALS_KRB_USER_KEYTAB`; nosasl smoke green |
+| 0.2.10 | 2026-08-08 | **K5c:** EXPLAIN Impala Auth/Principal; log_path_choice auth+principal; MODE=1 product path (Kudu rpc_authentication=required + client SASL) |

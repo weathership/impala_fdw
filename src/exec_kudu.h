@@ -2,7 +2,7 @@
  *
  * exec_kudu.h
  *    C API for direct Kudu scans (libkudu_client) — dual-path FDW executor.
- *    See docs/kudu_scan.md (PR-K0 stub; PR-K1+ real OpenTable/scanner).
+ *    See docs/kudu_scan.md (PR-K0–K5).
  *
  *-------------------------------------------------------------------------
  */
@@ -43,17 +43,32 @@ typedef struct ImpalaKuduPred
 } ImpalaKuduPred;
 
 /*
+ * PR-K5b: outbound auth for libkudu_client.
+ * mode: "nosasl" (default) or "kerberos".
+ * principal: optional; used for cache key + logging (e.g. signals@REALM).
+ * ccache: optional KRB5CCNAME (FILE:/path or DIR:…); if NULL, process env used.
+ * keytab: optional; if set with principal, kinit into ccache before Build.
+ * sasl_protocol: Kudu SPN primary; NULL → "kudu".
+ */
+typedef struct ImpalaKuduAuth
+{
+	const char *mode;
+	const char *principal;
+	const char *ccache;
+	const char *keytab;
+	const char *sasl_protocol;
+} ImpalaKuduAuth;
+
+/*
  * Open a Kudu scan.
  *
  * masters: comma-separated "host:port" list.
  * kudu_table: resolved Kudu table name (e.g. impala::atlas.edge_out).
  * columns / ncolumns: projected column names (Kudu names).
- * preds / npreds: borrowed for the duration of this call only; open deep-copies.
- * limit: -1 = none.
- * err: on failure, malloc'd message (caller free); include masters+table when possible.
- *
- * preds/npreds: borrowed for this call only; deep-copied into Kudu objects.
+ * preds / npreds: borrowed for this call only; deep-copied into Kudu objects.
  * npreds < 0: open an empty-result scan (empty IN; no RPC).
+ * auth: NULL or mode nosasl → unauthenticated client (lab).
+ * err: on failure, malloc'd message (caller free).
  *
  * Returns NULL on error.
  */
@@ -62,6 +77,7 @@ ImpalaKuduScan *impala_kudu_scan_open(const char *masters,
 									  const char **columns, int ncolumns,
 									  const ImpalaKuduPred *preds, int npreds,
 									  int64_t limit,
+									  const ImpalaKuduAuth *auth,
 									  char **err);
 
 /*

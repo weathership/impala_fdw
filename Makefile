@@ -84,8 +84,16 @@ ifeq ($(IMPALA_FDW_WITH_KUDU),1)
     $(error IMPALA_FDW_WITH_KUDU=1 but KUDU_CLIENT_INCDIR unset — need kudu/client/client.h)
   endif
   PG_CPPFLAGS += -I$(KUDU_CLIENT_INCDIR) -DIMPALA_FDW_WITH_KUDU=1
+  # PR-K5b: libkrb5 for optional keytab→ccache kinit before KuduClientBuilder
+  ifneq ($(SIG_KRB5_INC),)
+    PG_CPPFLAGS += -I$(SIG_KRB5_INC)
+  endif
   SHLIB_LINK += -L$(KUDU_CLIENT_LIBDIR) -lkudu_client \
     -Wl,-rpath,$(KUDU_CLIENT_LIBDIR)
+  ifneq ($(SIG_KRB5_LIB),)
+    SHLIB_LINK += -L$(SIG_KRB5_LIB) -Wl,-rpath,$(SIG_KRB5_LIB)
+  endif
+  SHLIB_LINK += $(shell pkg-config --libs krb5 2>/dev/null || echo -lkrb5)
   OBJS += src/exec_kudu.o src/kudu_pred.o
 endif
 

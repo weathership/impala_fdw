@@ -5,7 +5,8 @@
  *
  *    PR-K0: link + stub
  *    PR-K1: OpenTable, projection, LIMIT, client/table cache, READ_LATEST
- *    PR-K2: predicates (npreds > 0 still errors here)
+ *    PR-K2: predicates
+ *    PR-K5b: Kerberos SASL (builder + principal/ccache/keytab cache key)
  *
  *-------------------------------------------------------------------------
  */
@@ -20,6 +21,8 @@
 #include <kudu/util/monotime.h>
 #include <kudu/util/status.h>
 
+#include <krb5.h>
+
 #include <algorithm>
 #include <cctype>
 #include <climits>
@@ -30,6 +33,8 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <strings.h>
+#include <unistd.h>
 #include <vector>
 
 using kudu::MonoDelta;
@@ -60,7 +65,7 @@ static std::map<std::string, KuduClientEntry> g_kudu_clients;
 
 struct ImpalaKuduScan
 {
-	std::string masters_key;
+	std::string cache_key;	/* masters|mode|principal|ccache|keytab */
 	std::string table_name;
 	shared_ptr<KuduClient> client;
 	shared_ptr<KuduTable> table;
@@ -238,13 +243,214 @@ cell_to_pg_string(const KuduScanBatch::RowPtr &row, int col_idx,
 	}
 }
 
+/* ── PR-K5b: auth mode + client cache key ─────────────────────────────── */
+
+static bool
+auth_is_kerberos(const ImpalaKuduAuth *auth)
+{
+	if (auth == NULL || auth->mode == NULL || auth->mode[0] == '\0')
+		return false;
+	/* treat anything other than nosasl as kerberos (matches FDW option) */
+	return strcasecmp(auth->mode, "nosasl") != 0;
+}
+
+static std::string
+nz(const char *s)
+{
+	return (s && s[0]) ? std::string(s) : std::string();
+}
+
+/*
+ * Cache key: masters|mode|principal|ccache|keytab
+ * Prevents cross-principal client reuse in a multi-mapping backend.
+ */
+static std::string
+make_client_cache_key(const std::string &canon_masters,
+					  const ImpalaKuduAuth *auth)
+{
+	std::string mode = auth_is_kerberos(auth) ? "kerberos" : "nosasl";
+	std::string principal;
+	std::string ccache;
+	std::string keytab;
+	if (auth != NULL)
+	{
+		principal = nz(auth->principal);
+		ccache = nz(auth->ccache);
+		keytab = nz(auth->keytab);
+	}
+	/* If no explicit ccache, fold process KRB5CCNAME into key for kerberos */
+	if (auth_is_kerberos(auth) && ccache.empty())
+	{
+		const char *env = getenv("KRB5CCNAME");
+		if (env && env[0])
+			ccache = env;
+	}
+	std::ostringstream o;
+	o << canon_masters << '|' << mode << '|' << principal << '|' << ccache
+	  << '|' << keytab;
+	return o.str();
+}
+
+/*
+ * Optional keytab → ccache kinit (mechanism D). Uses libkrb5.
+ * If ccache_out is empty, uses FILE:/tmp/impala_fdw_krb5cc_<pid>.
+ * On success, *ccache_used is set to the KRB5CCNAME value to apply for Build.
+ */
 static Status
-get_or_create_client(const std::string &canon,
+kinit_from_keytab(const std::string &principal, const std::string &keytab,
+				  const std::string &ccache_in, std::string *ccache_used)
+{
+	if (principal.empty() || keytab.empty())
+		return Status::InvalidArgument("keytab kinit requires principal and keytab");
+
+	std::string ccache = ccache_in;
+	if (ccache.empty())
+	{
+		std::ostringstream o;
+		o << "FILE:/tmp/impala_fdw_krb5cc_" << static_cast<long>(getpid());
+		ccache = o.str();
+	}
+
+	krb5_context ctx = NULL;
+	krb5_error_code code = krb5_init_context(&ctx);
+	if (code)
+		return Status::RuntimeError("krb5_init_context failed");
+
+	krb5_principal princ = NULL;
+	krb5_keytab kt = NULL;
+	krb5_ccache cc = NULL;
+	krb5_creds creds;
+	memset(&creds, 0, sizeof(creds));
+	bool creds_valid = false;
+
+	auto cleanup = [&]() {
+		if (creds_valid)
+			krb5_free_cred_contents(ctx, &creds);
+		if (cc)
+			krb5_cc_close(ctx, cc);
+		if (kt)
+			krb5_kt_close(ctx, kt);
+		if (princ)
+			krb5_free_principal(ctx, princ);
+		if (ctx)
+			krb5_free_context(ctx);
+	};
+
+	code = krb5_parse_name(ctx, principal.c_str(), &princ);
+	if (code)
+	{
+		const char *msg = krb5_get_error_message(ctx, code);
+		std::string err = std::string("krb5_parse_name: ") + (msg ? msg : "?");
+		krb5_free_error_message(ctx, msg);
+		cleanup();
+		return Status::InvalidArgument(err);
+	}
+
+	code = krb5_kt_resolve(ctx, keytab.c_str(), &kt);
+	if (code)
+	{
+		const char *msg = krb5_get_error_message(ctx, code);
+		std::string err = std::string("krb5_kt_resolve: ") + (msg ? msg : "?") +
+						  " path=" + keytab;
+		krb5_free_error_message(ctx, msg);
+		cleanup();
+		return Status::IOError(err);
+	}
+
+	code = krb5_get_init_creds_keytab(ctx, &creds, princ, kt,
+									  /*start_time=*/0, /*in_tkt_service=*/NULL,
+									  /*options=*/NULL);
+	if (code)
+	{
+		const char *msg = krb5_get_error_message(ctx, code);
+		std::string err = std::string("krb5_get_init_creds_keytab: ") +
+						  (msg ? msg : "?");
+		krb5_free_error_message(ctx, msg);
+		cleanup();
+		return Status::NotAuthorized(err);
+	}
+	creds_valid = true;
+
+	code = krb5_cc_resolve(ctx, ccache.c_str(), &cc);
+	if (code)
+	{
+		const char *msg = krb5_get_error_message(ctx, code);
+		std::string err = std::string("krb5_cc_resolve: ") + (msg ? msg : "?");
+		krb5_free_error_message(ctx, msg);
+		cleanup();
+		return Status::IOError(err);
+	}
+
+	code = krb5_cc_initialize(ctx, cc, princ);
+	if (code)
+	{
+		const char *msg = krb5_get_error_message(ctx, code);
+		std::string err = std::string("krb5_cc_initialize: ") + (msg ? msg : "?");
+		krb5_free_error_message(ctx, msg);
+		cleanup();
+		return Status::IOError(err);
+	}
+
+	code = krb5_cc_store_cred(ctx, cc, &creds);
+	if (code)
+	{
+		const char *msg = krb5_get_error_message(ctx, code);
+		std::string err = std::string("krb5_cc_store_cred: ") + (msg ? msg : "?");
+		krb5_free_error_message(ctx, msg);
+		cleanup();
+		return Status::IOError(err);
+	}
+
+	cleanup();
+	*ccache_used = ccache;
+	return Status::OK();
+}
+
+/* RAII restore of KRB5CCNAME around client Build. */
+struct Krb5CcacheEnvGuard
+{
+	bool active;
+	bool had_prev;
+	std::string prev;
+
+	Krb5CcacheEnvGuard() : active(false), had_prev(false) {}
+
+	void apply(const std::string &ccache)
+	{
+		if (ccache.empty())
+			return;
+		const char *cur = getenv("KRB5CCNAME");
+		if (cur)
+		{
+			had_prev = true;
+			prev = cur;
+		}
+		else
+			had_prev = false;
+		setenv("KRB5CCNAME", ccache.c_str(), 1);
+		active = true;
+	}
+
+	~Krb5CcacheEnvGuard()
+	{
+		if (!active)
+			return;
+		if (had_prev)
+			setenv("KRB5CCNAME", prev.c_str(), 1);
+		else
+			unsetenv("KRB5CCNAME");
+	}
+};
+
+static Status
+get_or_create_client(const std::string &cache_key,
+					 const std::string &canon_masters,
+					 const ImpalaKuduAuth *auth,
 					 shared_ptr<KuduClient> *out_client,
 					 KuduClientEntry **out_entry)
 {
 	std::lock_guard<std::mutex> lock(g_kudu_mu);
-	auto it = g_kudu_clients.find(canon);
+	auto it = g_kudu_clients.find(cache_key);
 	if (it != g_kudu_clients.end() && it->second.client)
 	{
 		*out_client = it->second.client;
@@ -253,20 +459,58 @@ get_or_create_client(const std::string &canon,
 		return Status::OK();
 	}
 
+	bool kerberos = auth_is_kerberos(auth);
+	std::string ccache_for_build;
+	std::string principal = auth ? nz(auth->principal) : std::string();
+	std::string keytab = auth ? nz(auth->keytab) : std::string();
+	std::string ccache_opt = auth ? nz(auth->ccache) : std::string();
+
+	if (kerberos && !keytab.empty())
+	{
+		if (principal.empty())
+			return Status::InvalidArgument(
+				"auth=kerberos with keytab requires principal");
+		Status st = kinit_from_keytab(principal, keytab, ccache_opt,
+									  &ccache_for_build);
+		if (!st.ok())
+			return st.CloneAndPrepend("keytab kinit");
+	}
+	else if (kerberos && !ccache_opt.empty())
+		ccache_for_build = ccache_opt;
+	/* else: rely on ambient KRB5CCNAME / default ccache for kerberos */
+
+	Krb5CcacheEnvGuard env_guard;
+	if (!ccache_for_build.empty())
+		env_guard.apply(ccache_for_build);
+
 	KuduClientBuilder builder;
-	builder.master_server_addrs(split_masters_list(canon));
+	builder.master_server_addrs(split_masters_list(canon_masters));
 	builder.default_admin_operation_timeout(MonoDelta::FromSeconds(60));
 	builder.default_rpc_timeout(MonoDelta::FromSeconds(30));
+
+	if (kerberos)
+	{
+		std::string proto = (auth && auth->sasl_protocol && auth->sasl_protocol[0])
+								? auth->sasl_protocol
+								: "kudu";
+		builder.sasl_protocol_name(proto);
+		builder.require_authentication(true);
+	}
 
 	shared_ptr<KuduClient> client;
 	Status st = builder.Build(&client);
 	if (!st.ok())
+	{
+		if (kerberos)
+			return st.CloneAndPrepend(
+				"Kudu client Build (kerberos SASL; check KRB5CCNAME/keytab/SPN)");
 		return st;
+	}
 
 	KuduClientEntry entry;
 	entry.client = client;
 	entry.open_scans = 0;
-	auto ins = g_kudu_clients.emplace(canon, std::move(entry));
+	auto ins = g_kudu_clients.emplace(cache_key, std::move(entry));
 	*out_client = client;
 	if (out_entry)
 		*out_entry = &ins.first->second;
@@ -274,12 +518,12 @@ get_or_create_client(const std::string &canon,
 }
 
 static Status
-open_table_cached(const std::string &canon, const std::string &table_name,
+open_table_cached(const std::string &cache_key, const std::string &table_name,
 				  shared_ptr<KuduClient> client,
 				  shared_ptr<KuduTable> *out_table)
 {
 	std::lock_guard<std::mutex> lock(g_kudu_mu);
-	auto it = g_kudu_clients.find(canon);
+	auto it = g_kudu_clients.find(cache_key);
 	if (it == g_kudu_clients.end())
 		return Status::IllegalState("client entry missing");
 
@@ -305,19 +549,19 @@ open_table_cached(const std::string &canon, const std::string &table_name,
 }
 
 static void
-inc_open_scans(const std::string &canon)
+inc_open_scans(const std::string &cache_key)
 {
 	std::lock_guard<std::mutex> lock(g_kudu_mu);
-	auto it = g_kudu_clients.find(canon);
+	auto it = g_kudu_clients.find(cache_key);
 	if (it != g_kudu_clients.end())
 		it->second.open_scans++;
 }
 
 static void
-dec_open_scans(const std::string &canon)
+dec_open_scans(const std::string &cache_key)
 {
 	std::lock_guard<std::mutex> lock(g_kudu_mu);
-	auto it = g_kudu_clients.find(canon);
+	auto it = g_kudu_clients.find(cache_key);
 	if (it != g_kudu_clients.end() && it->second.open_scans > 0)
 		it->second.open_scans--;
 }
@@ -536,6 +780,7 @@ impala_kudu_scan_open_inner(const char *masters,
 							const char **columns, int ncolumns,
 							const ImpalaKuduPred *preds, int npreds,
 							int64_t limit,
+							const ImpalaKuduAuth *auth,
 							char **err);
 
 ImpalaKuduScan *
@@ -544,12 +789,14 @@ impala_kudu_scan_open(const char *masters,
 					  const char **columns, int ncolumns,
 					  const ImpalaKuduPred *preds, int npreds,
 					  int64_t limit,
+					  const ImpalaKuduAuth *auth,
 					  char **err)
 {
 	try
 	{
 		return impala_kudu_scan_open_inner(masters, kudu_table, columns,
-										   ncolumns, preds, npreds, limit, err);
+										   ncolumns, preds, npreds, limit,
+										   auth, err);
 	}
 	catch (const std::exception &ex)
 	{
@@ -572,6 +819,7 @@ impala_kudu_scan_open_inner(const char *masters,
 							const char **columns, int ncolumns,
 							const ImpalaKuduPred *preds, int npreds,
 							int64_t limit,
+							const ImpalaKuduAuth *auth,
 							char **err)
 {
 	if (err)
@@ -591,24 +839,32 @@ impala_kudu_scan_open_inner(const char *masters,
 	}
 
 	std::string canon = canonical_masters(masters);
+	std::string cache_key = make_client_cache_key(canon, auth);
 	std::string tname(kudu_table);
 
 	shared_ptr<KuduClient> client;
-	Status st = get_or_create_client(canon, &client, NULL);
+	Status st = get_or_create_client(cache_key, canon, auth, &client, NULL);
 	if (!st.ok())
 	{
 		if (err)
 		{
 			std::ostringstream o;
 			o << "impala_fdw: Kudu client Build failed for masters \"" << canon
-			  << "\": " << st.ToString();
+			  << "\"";
+			if (auth_is_kerberos(auth))
+			{
+				o << " auth=kerberos";
+				if (auth && auth->principal && auth->principal[0])
+					o << " principal=" << auth->principal;
+			}
+			o << ": " << st.ToString();
 			*err = dup_err(o.str());
 		}
 		return NULL;
 	}
 
 	shared_ptr<KuduTable> table;
-	st = open_table_cached(canon, tname, client, &table);
+	st = open_table_cached(cache_key, tname, client, &table);
 	if (!st.ok())
 	{
 		if (err)
@@ -624,7 +880,7 @@ impala_kudu_scan_open_inner(const char *masters,
 	}
 
 	std::unique_ptr<ImpalaKuduScan> scan(new ImpalaKuduScan());
-	scan->masters_key = canon;
+	scan->cache_key = cache_key;
 	scan->table_name = tname;
 	scan->client = client;
 	scan->table = table;
@@ -762,7 +1018,7 @@ impala_kudu_scan_open_inner(const char *masters,
 	}
 
 	scan->opened = true;
-	inc_open_scans(canon);
+	inc_open_scans(cache_key);
 	return scan.release();
 }
 
@@ -933,7 +1189,7 @@ impala_kudu_scan_close(ImpalaKuduScan *s)
 		{
 			(void)s->scanner->Close();
 			s->scanner.reset();
-			dec_open_scans(s->masters_key);
+			dec_open_scans(s->cache_key);
 			s->opened = false;
 		}
 		delete s;
