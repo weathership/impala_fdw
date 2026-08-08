@@ -1072,3 +1072,4 @@ Ordered, independently reviewable PRs.
 | 0.2.5 | 2026-08-07 | **PR-K4**: `--compare` / `--force-access` / `--measure exec`; gates on EXPLAIN ANALYZE; hop1 exec ~30ms; FTs `access=auto` |
 | 0.2.6 | 2026-08-07 | **Checkpoint-02**: N1 LIMIT under agg/sort/distinct; N2 multiset gate; N3 interrupt hook for hs2-smoke; N4 warm cache ~0.5ms; allowlist eq/IN-only |
 | 0.2.7 | 2026-08-07 | **PR-K5 plan verified** against code/headers/SPEC §11.3; staged K5a–K5e; yunikorn-core submodule noted out-of-band |
+| 0.2.8 | 2026-08-08 | **K5a landed** in devenv: SIGNALS_KUDU_KERBEROS, kudu keytab flags, signals:kudu-kerberos-smoke |
