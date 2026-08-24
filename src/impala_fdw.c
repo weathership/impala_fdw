@@ -31,10 +31,14 @@
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
+#include "nodes/execnodes.h"
+#include "nodes/plannodes.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/planmain.h"
+#include "optimizer/planner.h"
 #include "optimizer/restrictinfo.h"
 #include "parser/parsetree.h"
+#include "utils/varlena.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
@@ -174,6 +178,23 @@ static void impalaReScanForeignScan(ForeignScanState *node);
 static void impalaEndForeignScan(ForeignScanState *node);
 static void impalaExplainForeignScan(ForeignScanState *node,
 									 ExplainState *es);
+#ifdef IMPALA_FDW_WITH_KUDU
+static List *impalaPlanForeignModify(PlannerInfo *root,
+									 ModifyTable *plan,
+									 Index resultRelation,
+									 int subplan_index);
+static void impalaBeginForeignModify(ModifyTableState *mtstate,
+									 ResultRelInfo *rinfo,
+									 List *fdw_private,
+									 int subplan_index,
+									 int eflags);
+static TupleTableSlot *impalaExecForeignInsert(EState *estate,
+											   ResultRelInfo *rinfo,
+											   TupleTableSlot *slot,
+											   TupleTableSlot *planSlot);
+static void impalaEndForeignModify(EState *estate, ResultRelInfo *rinfo);
+static int	impalaIsForeignRelUpdatable(Relation rel);
+#endif
 
 static char *get_option_value(List *options, const char *optname);
 static char *resolve_kudu_column_name(Oid reloid, int attno, Relation rel);
@@ -249,6 +270,13 @@ impala_fdw_handler(PG_FUNCTION_ARGS)
 	routine->ReScanForeignScan = impalaReScanForeignScan;
 	routine->EndForeignScan = impalaEndForeignScan;
 	routine->ExplainForeignScan = impalaExplainForeignScan;
+#ifdef IMPALA_FDW_WITH_KUDU
+	routine->PlanForeignModify = impalaPlanForeignModify;
+	routine->BeginForeignModify = impalaBeginForeignModify;
+	routine->ExecForeignInsert = impalaExecForeignInsert;
+	routine->EndForeignModify = impalaEndForeignModify;
+	routine->IsForeignRelUpdatable = impalaIsForeignRelUpdatable;
+#endif
 
 	PG_RETURN_POINTER(routine);
 }
@@ -731,10 +759,12 @@ impala_begin_hs2_scan(ImpalaFdwScanState *festate,
 	elog(DEBUG1, "impala_fdw: shape=%s method=impala_sql sql=%s",
 		 festate->shape_id, festate->sql);
 
-	festate->hs2 = impala_hs2_connect(festate->host, festate->port,
-									  festate->auth,
-									  festate->principal,
-									  festate->database, &err);
+	festate->hs2 = impala_hs2_connect_ex(festate->host, festate->port,
+										 festate->auth,
+										 festate->principal,
+										 festate->database,
+										 festate->keytab,
+										 festate->ccache, &err);
 	if (festate->hs2 == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
@@ -1613,3 +1643,292 @@ impalaExplainForeignScan(ForeignScanState *node, ExplainState *es)
 								  limit_count);
 	ExplainPropertyText("Impala Remote SQL", sql, es);
 }
+
+#ifdef IMPALA_FDW_WITH_KUDU
+typedef struct ImpalaFdwModifyState
+{
+	ImpalaKuduModify *kudu;
+	List	   *target_attrs;
+	char	   *kudu_table;
+	MemoryContextCallback cb;
+	bool		cb_registered;
+} ImpalaFdwModifyState;
+
+static void
+impala_fdw_modify_mcxt_callback(void *arg)
+{
+	ImpalaFdwModifyState *st = (ImpalaFdwModifyState *) arg;
+
+	if (st && st->kudu)
+	{
+		impala_kudu_modify_close(st->kudu);
+		st->kudu = NULL;
+	}
+}
+
+static List *
+impalaPlanForeignModify(PlannerInfo *root,
+						ModifyTable *plan,
+						Index resultRelation,
+						int subplan_index)
+{
+	CmdType		operation = plan->operation;
+	RangeTblEntry *rte = planner_rt_fetch(resultRelation, root);
+	Relation	rel;
+	List	   *targetAttrs = NIL;
+	int			attnum;
+
+	(void) subplan_index;
+	if (operation != CMD_INSERT)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("impala_fdw: only INSERT is supported on Kudu foreign tables"),
+				 errdetail("Guru: #SL.00000027.FDWDML")));
+
+	rel = table_open(rte->relid, NoLock);
+	for (attnum = 1; attnum <= RelationGetDescr(rel)->natts; attnum++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(RelationGetDescr(rel), attnum - 1);
+
+		if (!attr->attisdropped)
+			targetAttrs = lappend_int(targetAttrs, attnum);
+	}
+	table_close(rel, NoLock);
+	return list_make1(targetAttrs);
+}
+
+static int
+impalaIsForeignRelUpdatable(Relation rel)
+{
+	ForeignTable *table = GetForeignTable(RelationGetRelid(rel));
+	List	   *options = list_copy(table->options);
+	char	   *access = get_option_value(options, OPTION_ACCESS);
+	char	   *kudu_table = get_option_value(options, OPTION_KUDU_TABLE);
+
+	if (access != NULL && strcmp(access, "impala_sql") == 0)
+		return 0;
+	if (kudu_table != NULL ||
+		(access != NULL && strcmp(access, "kudu_scan") == 0))
+		return (1 << CMD_INSERT);
+	return 0;
+}
+
+static void
+impalaBeginForeignModify(ModifyTableState *mtstate,
+						 ResultRelInfo *rinfo,
+						 List *fdw_private,
+						 int subplan_index,
+						 int eflags)
+{
+	Relation	rel = rinfo->ri_RelationDesc;
+	ForeignTable *ftable;
+	ForeignServer *server;
+	UserMapping *mapping;
+	List	   *options;
+	List	   *map_opts;
+	ImpalaFdwModifyState *st;
+	char	   *err = NULL;
+	char	   *access;
+	char	   *kudu_table_opt;
+	char	   *database;
+	char	   *table_name;
+	char	   *masters;
+	char	   *auth;
+	char	   *krb_realm;
+	char	   *map_principal;
+	char	   *map_keytab;
+	char	   *map_ccache;
+	const char *env_keytab;
+	bool		auth_kerberos;
+	ImpalaKuduAuth kauth;
+	List	   *target_attrs;
+	ListCell   *lc;
+	int			ncolumns;
+	const char **colnames;
+	int			i;
+
+	(void) mtstate;
+	(void) subplan_index;
+	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
+		return;
+
+	ftable = GetForeignTable(RelationGetRelid(rel));
+	server = GetForeignServer(ftable->serverid);
+	mapping = GetUserMapping(GetUserId(), ftable->serverid);
+	options = list_concat(list_copy(server->options), list_copy(ftable->options));
+	map_opts = list_copy(mapping->options);
+
+	access = get_option_value(options, OPTION_ACCESS);
+	if (access != NULL && strcmp(access, "impala_sql") == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("impala_fdw: INSERT requires access=kudu_scan (not HS2)"),
+				 errdetail("Guru: #SL.00000027.FDWDML")));
+
+	if (fdw_private == NIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_ERROR),
+				 errmsg("impala_fdw: INSERT missing plan private")));
+	target_attrs = (List *) linitial(fdw_private);
+
+	database = get_option_value(options, OPTION_DATABASE);
+	table_name = get_option_value(options, OPTION_TABLE);
+	kudu_table_opt = get_option_value(options, OPTION_KUDU_TABLE);
+	masters = get_option_value(options, OPTION_KUDU_MASTERS);
+	if (masters == NULL)
+		masters = "127.0.0.1:7051";
+	auth = get_option_value(options, OPTION_AUTH);
+	if (auth == NULL)
+		auth = "kerberos";
+	krb_realm = get_option_value(options, OPTION_KRB_REALM);
+	map_principal = get_option_value(map_opts, "principal");
+	map_keytab = get_option_value(map_opts, "keytab");
+	map_ccache = get_option_value(map_opts, "ccache");
+	auth_kerberos = (pg_strcasecmp(auth, "nosasl") != 0);
+
+	memset(&kauth, 0, sizeof(kauth));
+	kauth.mode = auth;
+	kauth.principal = impala_fdw_resolve_principal(map_principal, krb_realm,
+												   auth_kerberos);
+	env_keytab = impala_fdw_user_keytab_from_env();
+	if (map_keytab != NULL && map_keytab[0] != '\0')
+		kauth.keytab = map_keytab;
+	else
+		kauth.keytab = env_keytab;
+	kauth.ccache = (map_ccache != NULL && map_ccache[0] != '\0') ? map_ccache : NULL;
+
+	ncolumns = list_length(target_attrs);
+	colnames = (const char **) palloc(sizeof(char *) * ncolumns);
+	i = 0;
+	foreach(lc, target_attrs)
+	{
+		int			attno = lfirst_int(lc);
+
+		colnames[i++] = resolve_kudu_column_name(RelationGetRelid(rel), attno, rel);
+	}
+
+	st = (ImpalaFdwModifyState *) palloc0(sizeof(ImpalaFdwModifyState));
+	st->target_attrs = target_attrs;
+	st->kudu_table = resolve_kudu_table_name(kudu_table_opt, database, table_name);
+	st->kudu = impala_kudu_modify_open(masters, st->kudu_table, colnames, ncolumns,
+									   &kauth, &err);
+	if (st->kudu == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+				 errmsg("impala_fdw: kudu INSERT open failed: %s",
+						err ? err : "unknown"),
+				 errdetail("Guru: #SL.00000027.FDWDML")));
+	st->cb.func = impala_fdw_modify_mcxt_callback;
+	st->cb.arg = (void *) st;
+	MemoryContextRegisterResetCallback(CurrentMemoryContext, &st->cb);
+	st->cb_registered = true;
+	rinfo->ri_FdwState = (void *) st;
+}
+
+static TupleTableSlot *
+impalaExecForeignInsert(EState *estate,
+						ResultRelInfo *rinfo,
+						TupleTableSlot *slot,
+						TupleTableSlot *planSlot)
+{
+	ImpalaFdwModifyState *st = (ImpalaFdwModifyState *) rinfo->ri_FdwState;
+	ListCell   *lc;
+	int			n;
+	int			i;
+	ImpalaKuduCell *cells;
+	char	   *err = NULL;
+	TupleDesc	tupdesc;
+
+	(void) estate;
+	(void) planSlot;
+	if (st == NULL || st->kudu == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_ERROR),
+				 errmsg("impala_fdw: INSERT without kudu modify state")));
+
+	slot_getallattrs(slot);
+	tupdesc = slot->tts_tupleDescriptor;
+	n = list_length(st->target_attrs);
+	cells = (ImpalaKuduCell *) palloc0(sizeof(ImpalaKuduCell) * n);
+	i = 0;
+	foreach(lc, st->target_attrs)
+	{
+		int			attno = lfirst_int(lc);
+		bool		isnull = false;
+		Datum		d = slot_getattr(slot, attno, &isnull);
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, attno - 1);
+
+		cells[i].isnull = isnull ? 1 : 0;
+		cells[i].type_oid = attr->atttypid;
+		if (!isnull)
+		{
+			switch (attr->atttypid)
+			{
+				case INT2OID:
+					cells[i].i64 = DatumGetInt16(d);
+					break;
+				case INT4OID:
+					cells[i].i64 = DatumGetInt32(d);
+					break;
+				case INT8OID:
+					cells[i].i64 = DatumGetInt64(d);
+					break;
+				case FLOAT4OID:
+					cells[i].f8 = DatumGetFloat4(d);
+					break;
+				case FLOAT8OID:
+					cells[i].f8 = DatumGetFloat8(d);
+					break;
+				case BOOLOID:
+					cells[i].i64 = DatumGetBool(d) ? 1 : 0;
+					break;
+				case TEXTOID:
+				case VARCHAROID:
+					{
+						text	   *t = DatumGetTextPP(d);
+
+						cells[i].ptr = VARDATA_ANY(t);
+						cells[i].len = VARSIZE_ANY_EXHDR(t);
+						break;
+					}
+				default:
+					ereport(ERROR,
+							(errcode(ERRCODE_FDW_INVALID_DATA_TYPE),
+							 errmsg("impala_fdw: INSERT unsupported PG type OID %u",
+									attr->atttypid),
+							 errdetail("Guru: #SL.00000027.FDWDML")));
+			}
+		}
+		i++;
+	}
+	if (impala_kudu_modify_upsert(st->kudu, cells, n, &err) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_ERROR),
+				 errmsg("impala_fdw: Kudu UPSERT failed: %s",
+						err ? err : "unknown"),
+				 errdetail("Guru: #SL.00000027.FDWDML")));
+	return slot;
+}
+
+static void
+impalaEndForeignModify(EState *estate, ResultRelInfo *rinfo)
+{
+	ImpalaFdwModifyState *st = (ImpalaFdwModifyState *) rinfo->ri_FdwState;
+	char	   *err = NULL;
+
+	(void) estate;
+	if (st == NULL)
+		return;
+	if (st->kudu)
+	{
+		if (impala_kudu_modify_flush(st->kudu, &err) != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_ERROR),
+					 errmsg("impala_fdw: Kudu INSERT flush failed: %s",
+							err ? err : "unknown")));
+		impala_kudu_modify_close(st->kudu);
+		st->kudu = NULL;
+	}
+	rinfo->ri_FdwState = NULL;
+}
+#endif	/* IMPALA_FDW_WITH_KUDU */

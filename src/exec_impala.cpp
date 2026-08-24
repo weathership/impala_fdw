@@ -3,8 +3,10 @@
  * exec_impala.cpp
  *    Impala HiveServer2 client via Apache Thrift TCLIService.
  *
- * Phase 1: NOSASL (TSocket + TBufferedTransport + TBinaryProtocol).
- * Kerberos (GSSAPI/SASL) is intentional follow-on once this path is solid.
+ * NOSASL: TSocket + TBufferedTransport + TBinaryProtocol.
+ * Kerberos: GSSAPI SASL handshake on the socket fd, then TFramedTransport
+ * (QOP=auth) or Hs2SaslDataTransport (SSF>0). Stubs and libthrift must share
+ * a Thrift minor — generated TCLIService is 0.22.
  *
  *-------------------------------------------------------------------------
  */
@@ -12,17 +14,29 @@
 
 #include <thrift/protocol/TBinaryProtocol.h>
 #include <thrift/transport/TBufferTransports.h>
+#include <thrift/transport/TFDTransport.h>
 #include <thrift/transport/TSocket.h>
 
 #include "TCLIService.h"
 
+#include <sasl/sasl.h>
+#include <krb5.h>
+
+#include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
+#include <unistd.h>
+#include <cerrno>
+#include <sys/socket.h>
 #include <vector>
 
 using namespace apache::thrift;
@@ -32,10 +46,12 @@ using namespace apache::hive::service::cli::thrift;
 
 struct ImpalaHs2Session
 {
+	std::shared_ptr<TSocket> socket;
 	std::shared_ptr<TTransport> transport;
 	std::shared_ptr<TCLIServiceClient> client;
 	TSessionHandle session;
 	std::string database;
+	sasl_conn_t *sasl;
 };
 
 struct ImpalaHs2Result
@@ -313,11 +329,370 @@ load_batch(ImpalaHs2Result *r, std::string *err)
 	return 0;
 }
 
+/* Thrift SASL framing (same as Impala TSaslTransport / Python thrift_sasl). */
+enum Hs2SaslStatus
+{
+	HS2_SASL_START = 1,
+	HS2_SASL_OK = 2,
+	HS2_SASL_BAD = 3,
+	HS2_SASL_ERROR = 4,
+	HS2_SASL_COMPLETE = 5
+};
+
+static void
+fd_write_all(int fd, const void *p, size_t n)
+{
+	const uint8_t *b = static_cast<const uint8_t *>(p);
+	while (n > 0)
+	{
+		ssize_t w = send(fd, b, n, MSG_NOSIGNAL);
+		if (w < 0)
+		{
+			if (errno == EINTR)
+				continue;
+			throw TTransportException(std::string("HS2 send: ") + strerror(errno));
+		}
+		if (w == 0)
+			throw TTransportException("HS2 send: eof");
+		b += static_cast<size_t>(w);
+		n -= static_cast<size_t>(w);
+	}
+}
+
+static void
+fd_read_all(int fd, void *p, size_t n)
+{
+	uint8_t *b = static_cast<uint8_t *>(p);
+	while (n > 0)
+	{
+		ssize_t r = recv(fd, b, n, 0);
+		if (r < 0)
+		{
+			if (errno == EINTR)
+				continue;
+			throw TTransportException(std::string("HS2 recv: ") + strerror(errno));
+		}
+		if (r == 0)
+			throw TTransportException("HS2 recv: eof");
+		b += static_cast<size_t>(r);
+		n -= static_cast<size_t>(r);
+	}
+}
+
+static void
+hs2_sasl_send_fd(int fd, Hs2SaslStatus st, const void *payload, uint32_t len)
+{
+	uint8_t hdr[5];
+	hdr[0] = static_cast<uint8_t>(st);
+	hdr[1] = static_cast<uint8_t>(len >> 24);
+	hdr[2] = static_cast<uint8_t>(len >> 16);
+	hdr[3] = static_cast<uint8_t>(len >> 8);
+	hdr[4] = static_cast<uint8_t>(len);
+	fd_write_all(fd, hdr, 5);
+	if (len > 0 && payload != NULL)
+		fd_write_all(fd, payload, len);
+}
+
+static void
+hs2_sasl_recv_fd(int fd, Hs2SaslStatus *st, std::string *payload)
+{
+	uint8_t hdr[5];
+	fd_read_all(fd, hdr, 5);
+	*st = static_cast<Hs2SaslStatus>(hdr[0]);
+	uint32_t len = (uint32_t(hdr[1]) << 24) | (uint32_t(hdr[2]) << 16) |
+				   (uint32_t(hdr[3]) << 8) | uint32_t(hdr[4]);
+	payload->assign(len, '\0');
+	if (len > 0)
+		fd_read_all(fd, &(*payload)[0], len);
+}
+
+static std::string
+hs2_kinit_keytab(const std::string &principal, const std::string &keytab,
+				 const std::string &ccache_in)
+{
+	std::string ccache = ccache_in;
+	if (ccache.empty())
+	{
+		std::ostringstream o;
+		o << "FILE:/tmp/impala_fdw_hs2_krb5cc_" << static_cast<long>(getpid());
+		ccache = o.str();
+	}
+	krb5_context ctx = NULL;
+	if (krb5_init_context(&ctx))
+		throw std::runtime_error("krb5_init_context failed");
+	krb5_principal princ = NULL;
+	krb5_keytab kt = NULL;
+	krb5_ccache cc = NULL;
+	krb5_creds creds;
+	memset(&creds, 0, sizeof(creds));
+	krb5_error_code code = krb5_parse_name(ctx, principal.c_str(), &princ);
+	if (!code)
+		code = krb5_kt_resolve(ctx, keytab.c_str(), &kt);
+	if (!code)
+		code = krb5_cc_resolve(ctx, ccache.c_str(), &cc);
+	if (!code)
+		code = krb5_get_init_creds_keytab(ctx, &creds, princ, kt, 0, NULL, NULL);
+	if (!code)
+		code = krb5_cc_initialize(ctx, cc, princ);
+	if (!code)
+		code = krb5_cc_store_cred(ctx, cc, &creds);
+	std::string err;
+	if (code)
+	{
+		const char *msg = krb5_get_error_message(ctx, code);
+		err = msg ? msg : "kinit failed";
+		krb5_free_error_message(ctx, msg);
+	}
+	krb5_free_cred_contents(ctx, &creds);
+	if (cc)
+		krb5_cc_close(ctx, cc);
+	if (kt)
+		krb5_kt_close(ctx, kt);
+	if (princ)
+		krb5_free_principal(ctx, princ);
+	krb5_free_context(ctx);
+	if (code)
+		throw std::runtime_error(std::string("HS2 kinit: ") + err);
+	return ccache;
+}
+
+/*
+ * After SASL handshake, HS2 frames every Thrift message as 4-byte BE length +
+ * payload (Hive TSaslTransport). QOP=auth (SSF=0) is wire-identical to
+ * TFramedTransport; auth-int/conf uses sasl_encode/decode around the payload.
+ *
+ * Inherit TTransport and override *_virt — do not use TVirtualTransport with a
+ * private readAll (hides the CRTP default and produced a SIGSEGV on the first
+ * OpenSession read). Keep the TSocket alive for the fd; I/O is POSIX send/recv
+ * because TSocket::write after GSSAPI has faulted on this stack.
+ */
+class Hs2SaslDataTransport : public TTransport
+{
+ public:
+	Hs2SaslDataTransport(std::shared_ptr<TSocket> sock, sasl_conn_t *sasl, bool wrap)
+		: sock_(std::move(sock)), fd_(sock_->getSocketFD()), sasl_(sasl),
+		  wrap_(wrap), rpos_(0) {}
+
+	bool isOpen() const override { return sock_ && sock_->isOpen(); }
+	bool peek() override { return isOpen(); }
+	void open() override
+	{
+		if (sock_ && !sock_->isOpen())
+			sock_->open();
+		if (sock_)
+			fd_ = sock_->getSocketFD();
+	}
+	void close() override
+	{
+		if (sock_)
+			sock_->close();
+	}
+	void flush() override
+	{
+		if (wbuf_.empty())
+			return;
+		const uint8_t *payload = reinterpret_cast<const uint8_t *>(wbuf_.data());
+		uint32_t plen = static_cast<uint32_t>(wbuf_.size());
+		if (wrap_)
+		{
+			const char *out = NULL;
+			unsigned outlen = 0;
+			int rc = sasl_encode(sasl_, wbuf_.data(), plen, &out, &outlen);
+			if (rc != SASL_OK)
+				throw TTransportException(std::string("sasl_encode: ") +
+										  sasl_errdetail(sasl_));
+			payload = reinterpret_cast<const uint8_t *>(out);
+			plen = outlen;
+		}
+		uint8_t hdr[4] = {
+			static_cast<uint8_t>(plen >> 24), static_cast<uint8_t>(plen >> 16),
+			static_cast<uint8_t>(plen >> 8), static_cast<uint8_t>(plen)
+		};
+		fd_write_all(fd_, hdr, 4);
+		if (plen > 0)
+			fd_write_all(fd_, payload, plen);
+		wbuf_.clear();
+	}
+
+	uint32_t read_virt(uint8_t *buf, uint32_t len) override
+	{
+		if (rpos_ >= rbuf_.size())
+			fill();
+		uint32_t n = std::min(len, static_cast<uint32_t>(rbuf_.size() - rpos_));
+		if (n > 0)
+		{
+			memcpy(buf, rbuf_.data() + rpos_, n);
+			rpos_ += n;
+		}
+		return n;
+	}
+
+	void write_virt(const uint8_t *buf, uint32_t len) override
+	{
+		wbuf_.append(reinterpret_cast<const char *>(buf), len);
+	}
+
+ private:
+	void fill()
+	{
+		rbuf_.clear();
+		rpos_ = 0;
+		uint8_t hdr[4];
+		fd_read_all(fd_, hdr, 4);
+		uint32_t plen = (uint32_t(hdr[0]) << 24) | (uint32_t(hdr[1]) << 16) |
+						(uint32_t(hdr[2]) << 8) | uint32_t(hdr[3]);
+		if (plen > 32 * 1024 * 1024)
+			throw TTransportException("HS2 SASL frame too large");
+		std::string raw(plen, '\0');
+		if (plen > 0)
+			fd_read_all(fd_, &raw[0], plen);
+		if (wrap_)
+		{
+			const char *out = NULL;
+			unsigned outlen = 0;
+			int rc = sasl_decode(sasl_, raw.data(), plen, &out, &outlen);
+			if (rc != SASL_OK)
+				throw TTransportException(std::string("sasl_decode: ") +
+										  sasl_errdetail(sasl_));
+			rbuf_.assign(out, out + outlen);
+		}
+		else
+			rbuf_.swap(raw);
+	}
+
+	std::shared_ptr<TSocket> sock_;
+	int fd_;
+	sasl_conn_t *sasl_;
+	bool wrap_;
+	std::string rbuf_;
+	size_t rpos_;
+	std::string wbuf_;
+};
+
+static void
+hs2_sasl_gssapi(int fd, const std::string &host, sasl_conn_t **out_conn)
+{
+	*out_conn = NULL;
+	static std::once_flag sasl_once;
+	std::call_once(sasl_once, []() {
+#ifdef SASL_PLUGINDIR
+		setenv("SASL_PATH", SASL_PLUGINDIR, 0);
+#endif
+		int rc = sasl_client_init(NULL);
+		if (rc != SASL_OK)
+			throw std::runtime_error(std::string("sasl_client_init: ") +
+									 sasl_errstring(rc, NULL, NULL));
+	});
+
+	static sasl_callback_t cbs[] = {
+		{ SASL_CB_LIST_END, NULL, NULL }
+	};
+	sasl_conn_t *conn = NULL;
+	int rc = sasl_client_new("impala", host.c_str(), NULL, NULL, cbs, 0, &conn);
+	if (rc != SASL_OK)
+		throw std::runtime_error(std::string("sasl_client_new: ") +
+								 sasl_errstring(rc, NULL, NULL));
+
+	/* Prefer QOP=auth so post-handshake Thrift is not SASL-wrapped. */
+	sasl_security_properties_t sec;
+	memset(&sec, 0, sizeof(sec));
+	sec.min_ssf = 0;
+	sec.max_ssf = 0;
+	(void)sasl_setprop(conn, SASL_SEC_PROPS, &sec);
+
+	const char *out = NULL;
+	unsigned outlen = 0;
+	const char *mech = NULL;
+	rc = sasl_client_start(conn, "GSSAPI", NULL, &out, &outlen, &mech);
+	if (rc != SASL_OK && rc != SASL_CONTINUE)
+	{
+		std::string e = sasl_errdetail(conn);
+		sasl_dispose(&conn);
+		throw std::runtime_error(std::string("sasl_client_start GSSAPI: ") + e);
+	}
+
+	std::string mech_name = mech ? mech : "GSSAPI";
+	hs2_sasl_send_fd(fd, HS2_SASL_START, mech_name.data(),
+					 static_cast<uint32_t>(mech_name.size()));
+	hs2_sasl_send_fd(fd, HS2_SASL_OK, out, outlen);
+
+	bool got_complete = false;
+	while (rc == SASL_CONTINUE)
+	{
+		Hs2SaslStatus st;
+		std::string payload;
+		hs2_sasl_recv_fd(fd, &st, &payload);
+		if (st == HS2_SASL_COMPLETE)
+		{
+			got_complete = true;
+			if (!payload.empty())
+			{
+				rc = sasl_client_step(conn, payload.data(),
+									  static_cast<unsigned>(payload.size()),
+									  NULL, &out, &outlen);
+			}
+			else
+				rc = SASL_OK;
+			break;
+		}
+		if (st != HS2_SASL_OK)
+		{
+			sasl_dispose(&conn);
+			throw std::runtime_error("HS2 SASL peer status " +
+									 std::to_string(static_cast<int>(st)));
+		}
+		rc = sasl_client_step(conn, payload.data(),
+							  static_cast<unsigned>(payload.size()),
+							  NULL, &out, &outlen);
+		if (rc != SASL_OK && rc != SASL_CONTINUE)
+		{
+			std::string e = sasl_errdetail(conn);
+			sasl_dispose(&conn);
+			throw std::runtime_error(std::string("sasl_client_step: ") + e);
+		}
+		if (rc == SASL_CONTINUE || outlen > 0)
+			hs2_sasl_send_fd(fd, HS2_SASL_OK, out, outlen);
+	}
+
+	if (rc != SASL_OK)
+	{
+		sasl_dispose(&conn);
+		throw std::runtime_error("HS2 SASL GSSAPI did not complete");
+	}
+	/*
+	 * Impala TSaslTransport always sends a final COMPLETE (status=5, len=0)
+	 * after Cyrus returns SASL_OK. Leaving that 5-byte frame on the wire makes
+	 * TFramedTransport read 0x05000000 as a length. Guru: #SL.00000028.HS2GSSAPI
+	 */
+	if (!got_complete)
+	{
+		Hs2SaslStatus st;
+		std::string payload;
+		hs2_sasl_recv_fd(fd, &st, &payload);
+		if (st != HS2_SASL_COMPLETE)
+		{
+			sasl_dispose(&conn);
+			throw std::runtime_error("HS2 SASL expected COMPLETE, got " +
+									 std::to_string(static_cast<int>(st)));
+		}
+	}
+	*out_conn = conn;
+}
+
 extern "C" {
 
 ImpalaHs2Session *
 impala_hs2_connect(const char *host, int port, const char *auth,
 				   const char *principal, const char *database, char **errbuf)
+{
+	return impala_hs2_connect_ex(host, port, auth, principal, database,
+								 NULL, NULL, errbuf);
+}
+
+ImpalaHs2Session *
+impala_hs2_connect_ex(const char *host, int port, const char *auth,
+					  const char *principal, const char *database,
+					  const char *keytab, const char *ccache, char **errbuf)
 {
 	if (errbuf)
 		*errbuf = NULL;
@@ -325,15 +700,7 @@ impala_hs2_connect(const char *host, int port, const char *auth,
 	if (auth == NULL)
 		auth = "nosasl";
 
-	if (strcmp(auth, "kerberos") == 0)
-	{
-		if (errbuf)
-			*errbuf = dup_err(
-				"HS2 Kerberos/SASL not yet implemented; use auth=nosasl to "
-				"validate the thrift path first, then enable GSSAPI");
-		return NULL;
-	}
-	if (strcmp(auth, "nosasl") != 0)
+	if (strcmp(auth, "nosasl") != 0 && strcmp(auth, "kerberos") != 0)
 	{
 		if (errbuf)
 			*errbuf = dup_err(std::string("unsupported auth: ") + auth);
@@ -342,14 +709,71 @@ impala_hs2_connect(const char *host, int port, const char *auth,
 
 	try
 	{
-		auto sock = std::make_shared<TSocket>(host ? host : "127.0.0.1", port);
+		std::string hs2_host = host && host[0] ? host : "127.0.0.1";
+		const bool kerberos = (strcmp(auth, "kerberos") == 0);
+		if (kerberos &&
+			(hs2_host == "127.0.0.1" || hs2_host == "localhost" ||
+			 hs2_host == "::1"))
+		{
+			const char *fqdn = getenv("SIGNALS_KRB_HOST");
+			if (fqdn && fqdn[0])
+				hs2_host = fqdn;
+			else
+				throw std::runtime_error(
+					"HS2 GSSAPI requires FQDN host (not loopback). "
+					"Set SERVER OPTIONS (host 'tinybox.dev.vista.zndx.org') "
+					"or SIGNALS_KRB_HOST. Guru: #SL.00000028.HS2GSSAPI");
+		}
+
+		std::string ccache_used;
+		if (kerberos && keytab && keytab[0] && principal && principal[0])
+			ccache_used = hs2_kinit_keytab(principal, keytab,
+										   ccache ? ccache : "");
+		else if (kerberos && ccache && ccache[0])
+			ccache_used = ccache;
+
+		if (!ccache_used.empty())
+			setenv("KRB5CCNAME", ccache_used.c_str(), 1);
+
+		auto sock = std::make_shared<TSocket>(hs2_host, port);
 		sock->setConnTimeout(10000);
 		sock->setRecvTimeout(120000);
 		sock->setSendTimeout(60000);
-		auto transport = std::make_shared<TBufferedTransport>(sock);
+		sock->open();
+		sasl_conn_t *sasl = NULL;
+		std::shared_ptr<TTransport> transport;
+		if (kerberos)
+		{
+			int fd = sock->getSocketFD();
+			hs2_sasl_gssapi(fd, hs2_host, &sasl);
+			const void *ssf_p = NULL;
+			int ssf = 0;
+			if (sasl_getprop(sasl, SASL_SSF, &ssf_p) == SASL_OK && ssf_p)
+				ssf = *static_cast<const int *>(ssf_p);
+			/*
+			 * SSF=0 (QOP=auth): TFramedTransport matches Hive SASL data framing.
+			 * SSF>0: wrap with sasl_encode/decode. Stubs and libthrift MUST be
+			 * the same Thrift minor (generated TCLIService is 0.22; 0.16
+			 * TBinaryProtocol vtables lack writeUUID and SIGSEGV on the first
+			 * OpenSession read). Guru: #SL.00000028.HS2GSSAPI
+			 */
+			if (ssf > 0)
+				transport = std::make_shared<Hs2SaslDataTransport>(sock, sasl, true);
+			else
+			{
+				auto fdtrans = std::make_shared<TFDTransport>(
+					fd, TFDTransport::NO_CLOSE_ON_DESTROY);
+				transport = std::make_shared<TFramedTransport>(fdtrans);
+			}
+		}
+		else
+		{
+			transport = std::make_shared<TBufferedTransport>(sock);
+			if (!transport->isOpen())
+				transport->open();
+		}
 		auto protocol = std::make_shared<TBinaryProtocol>(transport);
 		auto client = std::make_shared<TCLIServiceClient>(protocol);
-		transport->open();
 
 		TOpenSessionReq oreq;
 		oreq.client_protocol = TProtocolVersion::HIVE_CLI_SERVICE_PROTOCOL_V6;
@@ -376,13 +800,21 @@ impala_hs2_connect(const char *host, int port, const char *auth,
 		}
 
 		auto *s = new ImpalaHs2Session();
+		s->socket = sock;
 		s->transport = transport;
 		s->client = client;
 		s->session = oresp.sessionHandle;
 		s->database = database ? database : "default";
+		s->sasl = sasl;
 		return s;
 	}
 	catch (const TException &ex)
+	{
+		if (errbuf)
+			*errbuf = dup_err(std::string("HS2 connect: ") + ex.what());
+		return NULL;
+	}
+	catch (const std::exception &ex)
 	{
 		if (errbuf)
 			*errbuf = dup_err(std::string("HS2 connect: ") + ex.what());
@@ -696,6 +1128,8 @@ impala_hs2_close(ImpalaHs2Session *session)
 		{
 		}
 	}
+	if (session->sasl)
+		sasl_dispose(&session->sasl);
 	delete session;
 }
 

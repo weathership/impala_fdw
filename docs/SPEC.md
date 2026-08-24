@@ -1,6 +1,6 @@
 # impala_fdw specification
 
-**Status:** Draft v0.4 (binding intent for implementation)  
+**Status:** Draft v0.5 (binding intent for implementation)  
 **Storage scope:** Kudu-backed Impala tables only  
 **Implementation language:** **C/C++** (PostgreSQL FDW + libkudu_client + HS2 thrift client)—no Java runtime in the extension process  
 **Tenancy:** **Single-tenant / governance-plane** (no multi-tenant isolation inside the FDW)  
@@ -33,6 +33,7 @@ PostgreSQL (:5455)
 | ID | Goal |
 |----|------|
 | G1 | Read Kudu table data from Postgres via foreign tables / foreign scans |
+| G11 | INSERT (UPSERT) Kudu rows through `kudu_scan` foreign tables so Gaius engine warehouse ingest exercises the FDW write path |
 | G2 | Prefer Impala HS2 for general SQL-shaped queries (joins, complex predicates, partner demos) |
 | G3 | Recognize governance/sigint scan shapes and run them on a **Kudu fast path** when safe |
 | G4 | Single extension, single type-mapping layer, dual executors |
@@ -49,7 +50,7 @@ PostgreSQL (:5455)
 |----|----------|
 | N1 | Full general-purpose BI FDW (arbitrary Impala SQL dialects beyond pushed scans) |
 | N2 | Iceberg or multi-format Impala tables |
-| N3 | DML (INSERT/UPDATE/DELETE) in v0–v1—read-only scans first |
+| N3 | UPDATE/DELETE (and INSERT over `impala_sql` / HS2) — INSERT is in-scope for `kudu_scan` only (G11, v0.5) |
 | N4 | Replacing Atlas REST, AGE schema, or Ranger policy evaluation engines |
 | N5 | Running Hive Metastore or standalone HiveServer2 |
 | N6 | Beeswax client support |
@@ -69,6 +70,7 @@ PostgreSQL (:5455)
 8. **Kerberos-first identity model** — Design options, user mapping, and connection setup for Kerberos from day one; `nosasl` is a devenv convenience, not the long-term default story.
 9. **Postgres-native access control** — Rely on PG roles, GRANT, and RLS on foreign tables / wrapping views; FDW does not invent tenants.
 10. **One principal end-to-end** — When the client authenticates to Postgres with GSSAPI, the FDW should authenticate to Impala/Kudu as **that same Kerberos principal** (not a fixed service keytab), using ticket cache / delegation patterns where the platform supports them.
+11. **INSERT through the FDW** — Gaius engine warehouse ingest writes `INSERT INTO gpu_metrics_tier0` on Postgres (`kudu_scan`). `gpu_metrics` is the HS2 UNION view of hot Kudu ∪ cold Iceberg and is not writable (N3). No silent C++ sidecar writer.
 
 ## 5. Objects and options
 

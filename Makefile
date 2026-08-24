@@ -62,7 +62,18 @@ endif
 ifneq ($(BOOST_HOME),)
   PG_CPPFLAGS += -I$(BOOST_HOME)/include
 endif
-SHLIB_LINK += -lthrift -lstdc++
+# HS2 GSSAPI (cyrus-sasl + libkrb5) — SIG_* from devenv / isolated build.
+ifneq ($(SIG_SASL_INC),)
+  PG_CPPFLAGS += -I$(SIG_SASL_INC)
+endif
+ifneq ($(SIG_KRB5_INC),)
+  PG_CPPFLAGS += -I$(SIG_KRB5_INC)
+endif
+ifneq ($(SIG_SASL_LIB),)
+  SHLIB_LINK += -L$(SIG_SASL_LIB) -Wl,-rpath,$(SIG_SASL_LIB)
+  PG_CPPFLAGS += -DSASL_PLUGINDIR=\"$(SIG_SASL_LIB)/sasl2\"
+endif
+SHLIB_LINK += -lthrift -lsasl2 -lkrb5 -lstdc++
 
 # Skip LLVM bitcode (C++ thrift objects break clang -emit-llvm here)
 with_llvm = no
@@ -132,3 +143,22 @@ tools/hs2_smoke: tools/hs2_smoke.cpp src/exec_impala.o gen-cpp/TCLIService.o gen
 		-o $@ tools/hs2_smoke.cpp src/exec_impala.o \
 		gen-cpp/TCLIService.o gen-cpp/TCLIService_types.o gen-cpp/TCLIService_constants.o \
 		-L$(THRIFT_HOME)/lib -lthrift -Wl,-rpath,$(THRIFT_HOME)/lib
+
+# GSSAPI HS2 client (no Postgres). THRIFT_HOME must be the same minor as the
+# generated TCLIService stubs (0.22). Linking libthrift 0.16 against 0.22
+# stubs SIGSEGVs on OpenSession read (writeUUID vtable slot).
+.PHONY: hs2-gssapi-test
+hs2-gssapi-test: tools/hs2_gssapi_test
+tools/hs2_gssapi_test: tools/hs2_gssapi_test.cpp src/exec_impala.o gen-cpp/TCLIService.o gen-cpp/TCLIService_types.o gen-cpp/TCLIService_constants.o
+	mkdir -p tools
+	$(CXX) -std=c++17 -g -rdynamic \
+		-I$(srcdir)/src -I$(srcdir)/gen-cpp -I$(THRIFT_HOME)/include \
+		$(if $(BOOST_HOME),-I$(BOOST_HOME)/include) \
+		$(if $(SIG_SASL_INC),-I$(SIG_SASL_INC)) \
+		$(if $(SIG_KRB5_INC),-I$(SIG_KRB5_INC)) \
+		-o $@ tools/hs2_gssapi_test.cpp src/exec_impala.o \
+		gen-cpp/TCLIService.o gen-cpp/TCLIService_types.o gen-cpp/TCLIService_constants.o \
+		-L$(THRIFT_HOME)/lib -Wl,-rpath,$(THRIFT_HOME)/lib -lthrift \
+		$(if $(SIG_SASL_LIB),-L$(SIG_SASL_LIB) -Wl,-rpath,$(SIG_SASL_LIB)) \
+		$(if $(SIG_KRB5_LIB),-L$(SIG_KRB5_LIB) -Wl,-rpath,$(SIG_KRB5_LIB)) \
+		-lsasl2 -lkrb5

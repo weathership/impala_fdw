@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * exec_impala.h
- *    C API for Impala HS2 (TCLIService) — phase 1 NOSASL; Kerberos later.
+ *    C API for Impala HS2 (TCLIService) — NOSASL and Kerberos GSSAPI.
  *
  *-------------------------------------------------------------------------
  */
@@ -20,7 +20,8 @@ typedef struct ImpalaHs2Result ImpalaHs2Result;
 
 /*
  * Connect and OpenSession.
- * auth: "nosasl" | "kerberos" (kerberos returns error until SASL wired).
+ * auth: "nosasl" | "kerberos" (GSSAPI SASL; SPN impala/<host>).
+ * keytab/ccache: optional Kerberos identity (NULL = ambient KRB5CCNAME).
  * errbuf: optional; if non-NULL and fail, malloc'd message (caller free).
  */
 ImpalaHs2Session *impala_hs2_connect(const char *host, int port,
@@ -28,6 +29,14 @@ ImpalaHs2Session *impala_hs2_connect(const char *host, int port,
 									 const char *principal,
 									 const char *database,
 									 char **errbuf);
+
+ImpalaHs2Session *impala_hs2_connect_ex(const char *host, int port,
+										const char *auth,
+										const char *principal,
+										const char *database,
+										const char *keytab,
+										const char *ccache,
+										char **errbuf);
 
 /* Execute SQL; returns result handle or NULL. Session remains open. */
 ImpalaHs2Result *impala_hs2_execute(ImpalaHs2Session *session,
