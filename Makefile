@@ -73,7 +73,18 @@ ifneq ($(SIG_SASL_LIB),)
   SHLIB_LINK += -L$(SIG_SASL_LIB) -Wl,-rpath,$(SIG_SASL_LIB)
   PG_CPPFLAGS += -DSASL_PLUGINDIR=\"$(SIG_SASL_LIB)/sasl2\"
 endif
-SHLIB_LINK += -lthrift -lsasl2 -lkrb5 -lstdc++
+ifneq ($(SIG_KRB5_LIB),)
+  SHLIB_LINK += -L$(SIG_KRB5_LIB) -Wl,-rpath,$(SIG_KRB5_LIB)
+endif
+ifneq ($(SIG_SSL_LIB),)
+  SHLIB_LINK += -L$(SIG_SSL_LIB) -Wl,-rpath,$(SIG_SSL_LIB)
+endif
+# Nix pkgs.thrift is 0.22 only. Impala toolchain libthrift-0.16.0.so must not
+# appear on the rpath (writeUUID vtable; OpenSession SIGSEGV).
+# --disable-new-dtags: DT_RPATH is searched for libkudu_client's NEEDED
+# (libgssapi_krb5.so.2) which RUNPATH on this .so does not cover.
+# Guru: #SL.00000028.HS2GSSAPI
+SHLIB_LINK += -Wl,--disable-new-dtags -lthrift -lsasl2 -lkrb5 -lgssapi_krb5 -lstdc++
 
 # Skip LLVM bitcode (C++ thrift objects break clang -emit-llvm here)
 with_llvm = no
