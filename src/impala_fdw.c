@@ -370,6 +370,12 @@ impala_sql_is_range_partition_stmt(const char *sql)
 
 	if (strncmp(buf, "show range partitions ", 22) == 0)
 		return true;
+	if (strncmp(buf, "create or replace view ", 23) == 0)
+		return true;
+	if (strncmp(buf, "create view ", 12) == 0)
+		return true;
+	if (strncmp(buf, "alter view ", 11) == 0)
+		return true;
 	if (strncmp(buf, "alter table ", 12) != 0)
 		return false;
 	return strstr(buf, " drop range partition ") != NULL ||
@@ -412,7 +418,7 @@ impala_fdw_exec(PG_FUNCTION_ARGS)
 	if (!impala_sql_is_range_partition_stmt(sql))
 		ereport(ERROR,
 				(errcode(ERRCODE_SYNTAX_ERROR),
-				 errmsg("impala_fdw_exec: only ALTER TABLE … ADD/DROP RANGE PARTITION or SHOW RANGE PARTITIONS"),
+				 errmsg("impala_fdw_exec: only RANGE PARTITION DDL, SHOW RANGE PARTITIONS, or CREATE VIEW"),
 				 errdetail("Guru: #SL.00000029.RANGEDDL")));
 
 	server = GetForeignServerByName(srvname, false);
