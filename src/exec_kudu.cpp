@@ -18,6 +18,8 @@
 #include <kudu/client/schema.h>
 #include <kudu/client/shared_ptr.h>
 #include <kudu/client/value.h>
+#include <kudu/client/write_op.h>
+#include <kudu/util/int128.h>
 #include <kudu/util/monotime.h>
 #include <kudu/util/status.h>
 
@@ -26,8 +28,10 @@
 #include <algorithm>
 #include <cctype>
 #include <climits>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -47,7 +51,9 @@ using kudu::client::KuduPredicate;
 using kudu::client::KuduScanBatch;
 using kudu::client::KuduScanner;
 using kudu::client::KuduSchema;
+using kudu::client::KuduSession;
 using kudu::client::KuduTable;
+using kudu::client::KuduUpsert;
 using kudu::client::KuduValue;
 using kudu::client::sp::shared_ptr;
 
@@ -79,7 +85,20 @@ struct ImpalaKuduScan
 	int64_t rows_returned;
 	int ncolumns;
 	std::vector<KuduColumnSchema::DataType> col_types;
+	std::vector<KuduColumnSchema> col_schemas;
 	std::vector<std::string> col_names;
+};
+
+struct ImpalaKuduModify
+{
+	std::string cache_key;
+	shared_ptr<KuduClient> client;
+	shared_ptr<KuduTable> table;
+	shared_ptr<KuduSession> session;
+	int ncolumns;
+	std::vector<std::string> col_names;
+	std::vector<KuduColumnSchema::DataType> col_types;
+	int pending;
 };
 
 static char *
@@ -166,9 +185,8 @@ bytes_to_pg_hex(const uint8_t *data, size_t len)
 	return out;
 }
 
-/* v1 Atlas freeze only (F4): BOOL, INT8, INT64, STRING, BINARY */
 static bool
-type_supported(KuduColumnSchema::DataType t)
+scalar_type_supported(KuduColumnSchema::DataType t)
 {
 	switch (t)
 	{
@@ -181,20 +199,314 @@ type_supported(KuduColumnSchema::DataType t)
 		case KuduColumnSchema::DOUBLE:
 		case KuduColumnSchema::STRING:
 		case KuduColumnSchema::BINARY:
+		case KuduColumnSchema::UNIXTIME_MICROS:
+		case KuduColumnSchema::DECIMAL:
+		case KuduColumnSchema::VARCHAR:
+		case KuduColumnSchema::DATE:
+		case KuduColumnSchema::SERIAL:
 			return true;
 		default:
 			return false;
 	}
 }
 
+/* All Kudu scalars plus 1D ARRAY (NESTED). Nested-of-nested is rejected. */
+static bool
+type_supported(const KuduColumnSchema &col)
+{
+	if (col.type() != KuduColumnSchema::NESTED)
+		return scalar_type_supported(col.type());
+	const KuduColumnSchema::KuduNestedTypeDescriptor *nt = col.nested_type();
+	if (nt == NULL || !nt->is_array() || nt->array() == NULL)
+		return false;
+	if (nt->array()->nested_type() != NULL)
+		return false;
+	/* SERIAL is UINT64; there is no public GetArrayUInt64. */
+	if (nt->array()->type() == KuduColumnSchema::SERIAL)
+		return false;
+	/* Kudu does not store DECIMAL128 (precision > 18) as 1D arrays. */
+	if (nt->array()->type() == KuduColumnSchema::DECIMAL &&
+		col.type_attributes().precision() > 18)
+		return false;
+	return scalar_type_supported(nt->array()->type());
+}
+
+/* PostgreSQL array-element quoting (backslash-escape, not SQL ident). */
+static std::string
+pg_array_quote_string(const std::string &s)
+{
+	std::string o = "\"";
+	for (char c : s)
+	{
+		if (c == '"' || c == '\\')
+			o += '\\';
+		o += c;
+	}
+	o += '"';
+	return o;
+}
+
+static std::string
+format_unscaled_decimal(kudu::int128_t unscaled, int scale)
+{
+	if (scale < 0)
+		scale = 0;
+	const bool neg = unscaled < 0;
+	unsigned __int128 mag;
+	if (!neg)
+		mag = static_cast<unsigned __int128>(unscaled);
+	else if (unscaled == kudu::INT128_MIN)
+		mag = static_cast<unsigned __int128>(1) << 127;
+	else
+		mag = static_cast<unsigned __int128>(-unscaled);
+
+	std::string digits;
+	if (mag == 0)
+		digits = "0";
+	else
+	{
+		while (mag > 0)
+		{
+			digits.push_back(static_cast<char>('0' + static_cast<int>(mag % 10)));
+			mag /= 10;
+		}
+		std::reverse(digits.begin(), digits.end());
+	}
+	if (scale == 0)
+		return (neg ? "-" : "") + digits;
+	if (static_cast<int>(digits.size()) <= scale)
+		digits.insert(0, static_cast<size_t>(scale - static_cast<int>(digits.size()) + 1),
+					  '0');
+	const size_t split = digits.size() - static_cast<size_t>(scale);
+	return (neg ? "-" : "") + digits.substr(0, split) + "." + digits.substr(split);
+}
+
+static std::string
+pg_array_literal(const std::vector<std::string> &elems,
+				 const std::vector<bool> &validity)
+{
+	std::string o = "{";
+	for (size_t i = 0; i < elems.size(); i++)
+	{
+		if (i > 0)
+			o += ",";
+		/* Empty validity bitmap means every element is valid (Kudu client). */
+		if (!validity.empty() && (i >= validity.size() || !validity[i]))
+			o += "NULL";
+		else
+			o += elems[i];
+	}
+	o += "}";
+	return o;
+}
+
+static std::string
+format_unix_micros(int64_t us)
+{
+	time_t sec = static_cast<time_t>(us / 1000000LL);
+	long usec = static_cast<long>(us % 1000000LL);
+	if (usec < 0)
+	{
+		sec -= 1;
+		usec += 1000000L;
+	}
+	struct tm tm;
+	memset(&tm, 0, sizeof(tm));
+	gmtime_r(&sec, &tm);
+	char buf[40];
+	snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d.%06ld+00",
+			 tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour,
+			 tm.tm_min, tm.tm_sec, usec);
+	return buf;
+}
+
+static std::string
+format_unix_days(int32_t days)
+{
+	time_t sec = static_cast<time_t>(days) * 86400;
+	struct tm tm;
+	memset(&tm, 0, sizeof(tm));
+	gmtime_r(&sec, &tm);
+	char buf[16];
+	snprintf(buf, sizeof(buf), "%04d-%02d-%02d", tm.tm_year + 1900,
+			 tm.tm_mon + 1, tm.tm_mday);
+	return buf;
+}
+
+static Status
+array_cell_to_pg(const KuduScanBatch::RowPtr &row, int col_idx,
+				 const KuduColumnSchema &col, std::string *out)
+{
+	const KuduColumnSchema::KuduNestedTypeDescriptor *nt = col.nested_type();
+	if (nt == NULL || !nt->is_array() || nt->array() == NULL)
+		return Status::NotSupported("NESTED column is not a 1D array");
+	const KuduColumnSchema::DataType elem = nt->array()->type();
+	std::vector<bool> validity;
+	std::vector<std::string> elems;
+	Status st;
+	switch (elem)
+	{
+		case KuduColumnSchema::BOOL:
+		{
+			std::vector<bool> data;
+			st = row.GetArrayBool(col_idx, &data, &validity);
+			if (!st.ok())
+				return st;
+			elems.reserve(data.size());
+			for (size_t i = 0; i < data.size(); i++)
+				elems.push_back(data[i] ? "t" : "f");
+			break;
+		}
+		case KuduColumnSchema::INT8:
+		{
+			std::vector<int8_t> data;
+			st = row.GetArrayInt8(col_idx, &data, &validity);
+			if (!st.ok())
+				return st;
+			for (int8_t v : data)
+				elems.push_back(std::to_string(static_cast<int>(v)));
+			break;
+		}
+		case KuduColumnSchema::INT16:
+		{
+			std::vector<int16_t> data;
+			st = row.GetArrayInt16(col_idx, &data, &validity);
+			if (!st.ok())
+				return st;
+			for (int16_t v : data)
+				elems.push_back(std::to_string(static_cast<int>(v)));
+			break;
+		}
+		case KuduColumnSchema::INT32:
+		{
+			std::vector<int32_t> data;
+			st = row.GetArrayInt32(col_idx, &data, &validity);
+			if (!st.ok())
+				return st;
+			for (int32_t v : data)
+				elems.push_back(std::to_string(v));
+			break;
+		}
+		case KuduColumnSchema::INT64:
+		{
+			std::vector<int64_t> data;
+			st = row.GetArrayInt64(col_idx, &data, &validity);
+			if (!st.ok())
+				return st;
+			for (int64_t v : data)
+				elems.push_back(std::to_string(v));
+			break;
+		}
+		case KuduColumnSchema::FLOAT:
+		{
+			std::vector<float> data;
+			st = row.GetArrayFloat(col_idx, &data, &validity);
+			if (!st.ok())
+				return st;
+			for (float v : data)
+				elems.push_back(std::to_string(v));
+			break;
+		}
+		case KuduColumnSchema::DOUBLE:
+		{
+			std::vector<double> data;
+			st = row.GetArrayDouble(col_idx, &data, &validity);
+			if (!st.ok())
+				return st;
+			for (double v : data)
+				elems.push_back(std::to_string(v));
+			break;
+		}
+		case KuduColumnSchema::UNIXTIME_MICROS:
+		{
+			std::vector<int64_t> data;
+			st = row.GetArrayUnixTimeMicros(col_idx, &data, &validity);
+			if (!st.ok())
+				return st;
+			for (int64_t v : data)
+				elems.push_back(pg_array_quote_string(format_unix_micros(v)));
+			break;
+		}
+		case KuduColumnSchema::DATE:
+		{
+			std::vector<int32_t> data;
+			st = row.GetArrayDate(col_idx, &data, &validity);
+			if (!st.ok())
+				return st;
+			for (int32_t v : data)
+				elems.push_back(pg_array_quote_string(format_unix_days(v)));
+			break;
+		}
+		case KuduColumnSchema::STRING:
+		case KuduColumnSchema::VARCHAR:
+		{
+			std::vector<Slice> data;
+			if (elem == KuduColumnSchema::VARCHAR)
+				st = row.GetArrayVarchar(col_idx, &data, &validity);
+			else
+				st = row.GetArrayString(col_idx, &data, &validity);
+			if (!st.ok())
+				return st;
+			for (const Slice &sl : data)
+				elems.push_back(pg_array_quote_string(std::string(
+					reinterpret_cast<const char *>(sl.data()), sl.size())));
+			break;
+		}
+		case KuduColumnSchema::BINARY:
+		{
+			std::vector<Slice> data;
+			st = row.GetArrayBinary(col_idx, &data, &validity);
+			if (!st.ok())
+				return st;
+			for (const Slice &sl : data)
+				elems.push_back(pg_array_quote_string(
+					bytes_to_pg_hex(sl.data(), sl.size())));
+			break;
+		}
+		case KuduColumnSchema::DECIMAL:
+		{
+			const int8_t prec = col.type_attributes().precision();
+			const int8_t scale = col.type_attributes().scale();
+			if (prec <= 9)
+			{
+				std::vector<int32_t> data;
+				st = row.GetArrayUnscaledDecimal(col_idx, &data, &validity);
+				if (!st.ok())
+					return st;
+				for (int32_t v : data)
+					elems.push_back(format_unscaled_decimal(v, scale));
+			}
+			else if (prec <= 18)
+			{
+				std::vector<int64_t> data;
+				st = row.GetArrayUnscaledDecimal(col_idx, &data, &validity);
+				if (!st.ok())
+					return st;
+				for (int64_t v : data)
+					elems.push_back(format_unscaled_decimal(v, scale));
+			}
+			else
+				return Status::NotSupported(
+					"DECIMAL128 1D arrays are not supported by Kudu");
+			break;
+		}
+		default:
+			return Status::NotSupported(
+				"unsupported Kudu 1D array element type");
+	}
+	*out = pg_array_literal(elems, validity);
+	return Status::OK();
+}
+
 static Status
 cell_to_pg_string(const KuduScanBatch::RowPtr &row, int col_idx,
-				  KuduColumnSchema::DataType dtype, std::string *out)
+				  const KuduColumnSchema &col, std::string *out)
 {
 	out->clear();
 	if (row.IsNull(col_idx))
 		return Status::OK(); /* caller treats empty + null flag */
 
+	const KuduColumnSchema::DataType dtype = col.type();
 	switch (dtype)
 	{
 		case KuduColumnSchema::BOOL:
@@ -278,8 +590,60 @@ cell_to_pg_string(const KuduScanBatch::RowPtr &row, int col_idx,
 			*out = bytes_to_pg_hex(sl.data(), sl.size());
 			return Status::OK();
 		}
+		case KuduColumnSchema::VARCHAR:
+		{
+			Slice sl;
+			Status st = row.GetVarchar(col_idx, &sl);
+			if (!st.ok())
+				return st;
+			out->assign(reinterpret_cast<const char *>(sl.data()), sl.size());
+			return Status::OK();
+		}
+		case KuduColumnSchema::UNIXTIME_MICROS:
+		{
+			int64_t v = 0;
+			Status st = row.GetUnixTimeMicros(col_idx, &v);
+			if (!st.ok())
+				return st;
+			*out = format_unix_micros(v);
+			return Status::OK();
+		}
+		case KuduColumnSchema::DATE:
+		{
+			int32_t v = 0;
+			Status st = row.GetDate(col_idx, &v);
+			if (!st.ok())
+				return st;
+			*out = format_unix_days(v);
+			return Status::OK();
+		}
+		case KuduColumnSchema::DECIMAL:
+		{
+#if KUDU_INT128_SUPPORTED
+			kudu::int128_t v = 0;
+			Status st = row.GetUnscaledDecimal(col_idx, &v);
+			if (!st.ok())
+				return st;
+			*out = format_unscaled_decimal(v, col.type_attributes().scale());
+			return Status::OK();
+#else
+			return Status::NotSupported("DECIMAL requires int128");
+#endif
+		}
+		case KuduColumnSchema::SERIAL:
+		{
+			/* Stored as UINT64; no public GetUInt64 on RowPtr. */
+			const uint64_t v =
+				*reinterpret_cast<const uint64_t *>(row.cell(col_idx));
+			*out = std::to_string(v);
+			return Status::OK();
+		}
+		case KuduColumnSchema::NESTED:
+			return array_cell_to_pg(row, col_idx, col, out);
 		default:
-			return Status::NotSupported("unsupported Kudu column type for v1");
+			return Status::NotSupported(
+				std::string("unsupported Kudu column type ") +
+				KuduColumnSchema::DataTypeToString(dtype));
 	}
 }
 
@@ -647,31 +1011,71 @@ make_kudu_value(const ImpalaKuduPred *pred, int vidx,
 			return Status::OK();
 		}
 		case KuduColumnSchema::INT8:
+		case KuduColumnSchema::INT16:
+		case KuduColumnSchema::INT32:
 		case KuduColumnSchema::INT64:
+		case KuduColumnSchema::SERIAL:
+		case KuduColumnSchema::UNIXTIME_MICROS:
+		case KuduColumnSchema::DATE:
 		{
 			int64_t v = 0;
-			if (pg_ty == 21) /* INT2OID — state smallint vs TINYINT */
+			if (pg_ty == 21) /* INT2OID */
 				v = *static_cast<const int16_t *>(ptr);
-			else if (pg_ty == 23) /* INT4OID */
+			else if (pg_ty == 23 || pg_ty == 1082) /* INT4OID / DATEOID */
 				v = *static_cast<const int32_t *>(ptr);
-			else if (pg_ty == 20) /* INT8OID */
+			else if (pg_ty == 20 || pg_ty == 1114 || pg_ty == 1184)
+				/* INT8OID / TIMESTAMPOID / TIMESTAMPTZOID — already epoch units */
 				v = *static_cast<const int64_t *>(ptr);
 			else
-				return Status::InvalidArgument("integer column needs int Const");
+				return Status::InvalidArgument("integer/time column needs int Const");
 
-			if (dtype == KuduColumnSchema::INT8 &&
-				(v < -128 || v > 127))
+			if (dtype == KuduColumnSchema::INT8 && (v < -128 || v > 127))
 				return Status::InvalidArgument("value out of range for INT8/TINYINT");
+			if (dtype == KuduColumnSchema::INT16 && (v < -32768 || v > 32767))
+				return Status::InvalidArgument("value out of range for INT16/SMALLINT");
+			if (dtype == KuduColumnSchema::INT32 &&
+				(v < static_cast<int64_t>(INT32_MIN) ||
+				 v > static_cast<int64_t>(INT32_MAX)))
+				return Status::InvalidArgument("value out of range for INT32");
+			if (dtype == KuduColumnSchema::DATE &&
+				(v < static_cast<int64_t>(INT32_MIN) ||
+				 v > static_cast<int64_t>(INT32_MAX)))
+				return Status::InvalidArgument("value out of range for DATE");
 
 			*out = KuduValue::FromInt(v);
 			return Status::OK();
 		}
+		case KuduColumnSchema::FLOAT:
+		{
+			float v = 0;
+			if (pg_ty == 700) /* FLOAT4OID */
+				v = *static_cast<const float *>(ptr);
+			else if (pg_ty == 701) /* FLOAT8OID */
+				v = static_cast<float>(*static_cast<const double *>(ptr));
+			else
+				return Status::InvalidArgument("FLOAT column needs float Const");
+			*out = KuduValue::FromFloat(v);
+			return Status::OK();
+		}
+		case KuduColumnSchema::DOUBLE:
+		{
+			double v = 0;
+			if (pg_ty == 701) /* FLOAT8OID */
+				v = *static_cast<const double *>(ptr);
+			else if (pg_ty == 700) /* FLOAT4OID */
+				v = *static_cast<const float *>(ptr);
+			else
+				return Status::InvalidArgument("DOUBLE column needs float Const");
+			*out = KuduValue::FromDouble(v);
+			return Status::OK();
+		}
 		case KuduColumnSchema::STRING:
+		case KuduColumnSchema::VARCHAR:
 		{
 			/* pack_const normalizes all text types to TEXTOID (25) */
 			if (pg_ty != 25)
 				return Status::InvalidArgument(
-					"STRING column needs text Const (TEXTOID payload)");
+					"STRING/VARCHAR column needs text Const (TEXTOID payload)");
 			*out = KuduValue::CopyString(
 				Slice(static_cast<const char *>(ptr), static_cast<size_t>(len)));
 			return Status::OK();
@@ -685,8 +1089,16 @@ make_kudu_value(const ImpalaKuduPred *pred, int vidx,
 				Slice(static_cast<const uint8_t *>(ptr), static_cast<size_t>(len)));
 			return Status::OK();
 		}
+		case KuduColumnSchema::NESTED:
+			return Status::NotSupported(
+				"Kudu 1D ARRAY columns cannot be used as kudu_scan predicates");
+		case KuduColumnSchema::DECIMAL:
+			return Status::NotSupported(
+				"DECIMAL predicates on kudu_scan are not implemented");
 		default:
-			return Status::NotSupported("unsupported Kudu type for predicate");
+			return Status::NotSupported(
+				std::string("unsupported Kudu type for predicate: ") +
+				KuduColumnSchema::DataTypeToString(dtype));
 	}
 }
 
@@ -979,20 +1391,20 @@ impala_kudu_scan_open_inner(const char *masters,
 			return NULL;
 		}
 		KuduColumnSchema col = schema.Column(static_cast<size_t>(found));
-		if (!type_supported(col.type()))
+		if (!type_supported(col))
 		{
 			if (err)
 			{
 				std::ostringstream o;
 				o << "impala_fdw: unsupported Kudu type "
 				  << KuduColumnSchema::DataTypeToString(col.type())
-				  << " for column \"" << cname
-				  << "\" (v1 Atlas types only)";
+				  << " for column \"" << cname << "\"";
 				*err = dup_err(o.str());
 			}
 			return NULL;
 		}
 		scan->col_types.push_back(col.type());
+		scan->col_schemas.push_back(col);
 		scan->col_names.push_back(cname);
 	}
 	scan->ncolumns = static_cast<int>(proj.size());
@@ -1173,7 +1585,7 @@ impala_kudu_scan_next_inner(ImpalaKuduScan *s,
 			continue;
 		}
 		std::string cell;
-		Status st = cell_to_pg_string(row, i, s->col_types[i], &cell);
+		Status st = cell_to_pg_string(row, i, s->col_schemas[i], &cell);
 		if (!st.ok())
 		{
 			for (int j = 0; j < i; j++)
@@ -1237,6 +1649,257 @@ impala_kudu_scan_close(ImpalaKuduScan *s)
 	catch (...)
 	{
 		/* best-effort teardown only */
+	}
+}
+
+static ImpalaKuduModify *
+impala_kudu_modify_open_inner(const char *masters,
+							  const char *kudu_table,
+							  const char **columns, int ncolumns,
+							  const ImpalaKuduAuth *auth,
+							  char **err)
+{
+	if (err)
+		*err = NULL;
+	if (kudu_table == NULL || kudu_table[0] == '\0')
+	{
+		if (err)
+			*err = dup_err("impala_fdw: kudu_modify_open: empty kudu_table");
+		return NULL;
+	}
+	std::string canon = canonical_masters(masters);
+	std::string cache_key = make_client_cache_key(canon, auth);
+	shared_ptr<KuduClient> client;
+	KuduClientEntry *entry = NULL;
+	Status st = get_or_create_client(cache_key, canon, auth, &client, &entry);
+	if (!st.ok())
+	{
+		if (err)
+			*err = dup_err(std::string("impala_fdw: kudu_modify client: ") +
+						   st.ToString());
+		return NULL;
+	}
+	shared_ptr<KuduTable> table;
+	st = open_table_cached(cache_key, kudu_table, client, &table);
+	if (!st.ok())
+	{
+		if (err)
+			*err = dup_err(std::string("impala_fdw: kudu_modify OpenTable: ") +
+						   st.ToString());
+		return NULL;
+	}
+	shared_ptr<KuduSession> session = client->NewSession();
+	st = session->SetFlushMode(KuduSession::AUTO_FLUSH_BACKGROUND);
+	if (st.ok())
+		session->SetTimeoutMillis(30000);
+	if (!st.ok())
+	{
+		if (err)
+			*err = dup_err(std::string("impala_fdw: kudu_modify session: ") +
+						   st.ToString());
+		return NULL;
+	}
+
+	ImpalaKuduModify *m = new ImpalaKuduModify();
+	m->cache_key = cache_key;
+	m->client = client;
+	m->table = table;
+	m->session = session;
+	m->ncolumns = ncolumns;
+	m->pending = 0;
+	const KuduSchema &schema = table->schema();
+	if (ncolumns <= 0)
+	{
+		m->ncolumns = static_cast<int>(schema.num_columns());
+		for (int i = 0; i < m->ncolumns; i++)
+		{
+			KuduColumnSchema col = schema.Column(static_cast<size_t>(i));
+			m->col_names.push_back(col.name());
+			m->col_types.push_back(col.type());
+		}
+	}
+	else
+	{
+		for (int i = 0; i < ncolumns; i++)
+		{
+			const char *cname = columns[i] ? columns[i] : "";
+			int found = -1;
+			for (int j = 0; j < static_cast<int>(schema.num_columns()); j++)
+			{
+				if (schema.Column(static_cast<size_t>(j)).name() == cname)
+				{
+					found = j;
+					break;
+				}
+			}
+			if (found < 0)
+			{
+				delete m;
+				if (err)
+					*err = dup_err(std::string("impala_fdw: unknown Kudu column ") +
+								   cname);
+				return NULL;
+			}
+			KuduColumnSchema col = schema.Column(static_cast<size_t>(found));
+			m->col_names.push_back(col.name());
+			m->col_types.push_back(col.type());
+		}
+	}
+	return m;
+}
+
+ImpalaKuduModify *
+impala_kudu_modify_open(const char *masters,
+						const char *kudu_table,
+						const char **columns, int ncolumns,
+						const ImpalaKuduAuth *auth,
+						char **err)
+{
+	try
+	{
+		return impala_kudu_modify_open_inner(masters, kudu_table, columns,
+											 ncolumns, auth, err);
+	}
+	catch (const std::exception &ex)
+	{
+		if (err)
+			*err = dup_err(std::string("impala_fdw: kudu_modify_open: ") +
+						   ex.what());
+		return NULL;
+	}
+}
+
+static Status
+set_cell(kudu::KuduPartialRow *row, const std::string &name,
+		 KuduColumnSchema::DataType dtype, const ImpalaKuduCell &cell)
+{
+	if (cell.isnull)
+		return row->SetNull(name);
+	switch (dtype)
+	{
+		case KuduColumnSchema::INT8:
+			return row->SetInt8(name, static_cast<int8_t>(cell.i64));
+		case KuduColumnSchema::INT16:
+			return row->SetInt16(name, static_cast<int16_t>(cell.i64));
+		case KuduColumnSchema::INT32:
+		case KuduColumnSchema::DATE:
+			return row->SetInt32(name, static_cast<int32_t>(cell.i64));
+		case KuduColumnSchema::INT64:
+		case KuduColumnSchema::UNIXTIME_MICROS:
+		case KuduColumnSchema::SERIAL:
+			return row->SetInt64(name, cell.i64);
+		case KuduColumnSchema::FLOAT:
+			return row->SetFloat(name, static_cast<float>(cell.f8));
+		case KuduColumnSchema::DOUBLE:
+			return row->SetDouble(name, cell.f8);
+		case KuduColumnSchema::BOOL:
+			return row->SetBool(name, cell.i64 != 0);
+		case KuduColumnSchema::STRING:
+		case KuduColumnSchema::VARCHAR:
+			return row->SetString(name, Slice(cell.ptr ? cell.ptr : "",
+											  static_cast<size_t>(cell.len)));
+		case KuduColumnSchema::BINARY:
+			return row->SetBinary(name, Slice(cell.ptr ? cell.ptr : "",
+											  static_cast<size_t>(cell.len)));
+		default:
+			return Status::NotSupported(
+				std::string("kudu_modify: cannot INSERT column type ") +
+				KuduColumnSchema::DataTypeToString(dtype));
+	}
+}
+
+int
+impala_kudu_modify_upsert(ImpalaKuduModify *m,
+						  const ImpalaKuduCell *cells,
+						  int nfields,
+						  char **err)
+{
+	if (err)
+		*err = NULL;
+	if (m == NULL || m->session == NULL || m->table == NULL)
+	{
+		if (err)
+			*err = dup_err("impala_fdw: kudu_modify_upsert: not open");
+		return -1;
+	}
+	if (nfields != m->ncolumns)
+	{
+		if (err)
+			*err = dup_err("impala_fdw: kudu_modify_upsert: column count mismatch");
+		return -1;
+	}
+	try
+	{
+		KuduUpsert *up = m->table->NewUpsert();
+		kudu::KuduPartialRow *row = up->mutable_row();
+		Status st;
+		for (int i = 0; i < nfields; i++)
+		{
+			st = set_cell(row, m->col_names[static_cast<size_t>(i)],
+						  m->col_types[static_cast<size_t>(i)], cells[i]);
+			if (!st.ok())
+			{
+				delete up;
+				if (err)
+					*err = dup_err(std::string("impala_fdw: set ") +
+								   m->col_names[static_cast<size_t>(i)] +
+								   ": " + st.ToString());
+				return -1;
+			}
+		}
+		st = m->session->Apply(up);
+		if (!st.ok())
+		{
+			if (err)
+				*err = dup_err(std::string("impala_fdw: Apply: ") + st.ToString());
+			return -1;
+		}
+		m->pending++;
+		if (m->pending >= 32)
+			return impala_kudu_modify_flush(m, err);
+		return 0;
+	}
+	catch (const std::exception &ex)
+	{
+		if (err)
+			*err = dup_err(std::string("impala_fdw: kudu_modify_upsert: ") +
+						   ex.what());
+		return -1;
+	}
+}
+
+int
+impala_kudu_modify_flush(ImpalaKuduModify *m, char **err)
+{
+	if (err)
+		*err = NULL;
+	if (m == NULL || m->session == NULL)
+		return 0;
+	Status st = m->session->Flush();
+	m->pending = 0;
+	if (!st.ok())
+	{
+		if (err)
+			*err = dup_err(std::string("impala_fdw: kudu_modify Flush: ") +
+						   st.ToString());
+		return -1;
+	}
+	return 0;
+}
+
+void
+impala_kudu_modify_close(ImpalaKuduModify *m)
+{
+	try
+	{
+		if (m == NULL)
+			return;
+		if (m->session)
+			(void)m->session->Flush();
+		delete m;
+	}
+	catch (...)
+	{
 	}
 }
 

@@ -94,6 +94,34 @@ void			impala_kudu_scan_close(ImpalaKuduScan *s);
 /* True if this build was linked with libkudu_client (IMPALA_FDW_WITH_KUDU). */
 bool			impala_kudu_scan_available(void);
 
+/*
+ * INSERT/UPSERT (SPEC v0.5). Typed cells from PG Datums.
+ * type_oid: INT2/4/8, FLOAT4/8, BOOLOID, TEXTOID, BYTEAOID.
+ */
+typedef struct ImpalaKuduCell
+{
+	unsigned int	type_oid;
+	int				isnull;
+	int64_t			i64;
+	double			f8;
+	const char	   *ptr;
+	int				len;
+} ImpalaKuduCell;
+
+typedef struct ImpalaKuduModify ImpalaKuduModify;
+
+ImpalaKuduModify *impala_kudu_modify_open(const char *masters,
+										  const char *kudu_table,
+										  const char **columns, int ncolumns,
+										  const ImpalaKuduAuth *auth,
+										  char **err);
+int				impala_kudu_modify_upsert(ImpalaKuduModify *m,
+										  const ImpalaKuduCell *cells,
+										  int nfields,
+										  char **err);
+int				impala_kudu_modify_flush(ImpalaKuduModify *m, char **err);
+void			impala_kudu_modify_close(ImpalaKuduModify *m);
+
 #ifdef __cplusplus
 }
 #endif

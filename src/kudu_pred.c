@@ -15,8 +15,10 @@
 #include "nodes/nodeFuncs.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/date.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
+#include "utils/timestamp.h"
 
 #include "kudu_pred.h"
 
@@ -200,6 +202,30 @@ pack_const(Const *c, const void **ptr_out, int *len_out, Oid *type_out,
 				memcpy(buf, VARDATA_ANY(b), len);
 			*ptr_out = buf;
 			*len_out = len;
+			return true;
+		}
+		case TIMESTAMPOID:
+		case TIMESTAMPTZOID:
+		{
+			/*
+			 * PG timestamp is µs since 2000-01-01; Kudu UNIXTIME_MICROS is
+			 * µs since 1970-01-01 (946684800 s).
+			 */
+			int64	   *p = (int64 *) palloc(sizeof(int64));
+
+			*p = DatumGetTimestamp(c->constvalue) + 946684800000000LL;
+			*ptr_out = p;
+			*type_out = INT8OID;
+			return true;
+		}
+		case DATEOID:
+		{
+			/* PG date is days since 2000-01-01; Kudu DATE is days since 1970. */
+			int32	   *p = (int32 *) palloc(sizeof(int32));
+
+			*p = DatumGetDateADT(c->constvalue) + 10957;
+			*ptr_out = p;
+			*type_out = DATEOID;
 			return true;
 		}
 		default:
