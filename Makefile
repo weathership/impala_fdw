@@ -120,7 +120,7 @@ ifeq ($(IMPALA_FDW_WITH_KUDU),1)
 endif
 
 EXTENSION = impala_fdw
-DATA = sql/impala_fdw--0.1.0.sql
+DATA = sql/impala_fdw--0.1.0.sql sql/impala_fdw--0.1.0--0.1.1.sql sql/impala_fdw--0.1.1.sql
 
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)

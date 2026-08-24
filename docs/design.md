@@ -26,7 +26,7 @@ PostgreSQL (:5455)
 
 ## Storage
 
-**Kudu only.** No Iceberg / HDFS / other Impala formats in v1.
+**Kudu hot + Iceberg cold.** `kudu_scan` is Kudu-only. `impala_sql` reads Iceberg and UNION views. Expire with `DROP RANGE PARTITION`.
 
 ## Status
 

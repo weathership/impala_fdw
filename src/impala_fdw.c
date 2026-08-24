@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * impala_fdw.c
- *    Foreign Data Wrapper for Apache Impala (HS2) → Kudu storage only.
+ *    Foreign Data Wrapper for Apache Impala (HS2) → Kudu hot + Iceberg cold.
  *
  * Phase 1+: HS2 scans with projection, PK/eq predicates, IN / = ANY pushdown
  * (Atlas projection freeze). PR-K1: kudu_scan projection/LIMIT path (no preds).
@@ -12,6 +12,8 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+
+#include <ctype.h>
 
 #include "access/htup_details.h"
 #include "access/parallel.h"
@@ -27,6 +29,7 @@
 #include "executor/tuptable.h"
 #include "foreign/fdwapi.h"
 #include "foreign/foreign.h"
+#include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
@@ -158,6 +161,7 @@ void		_PG_init(void);
 
 PG_FUNCTION_INFO_V1(impala_fdw_handler);
 PG_FUNCTION_INFO_V1(impala_fdw_validator);
+PG_FUNCTION_INFO_V1(impala_fdw_exec);
 
 static void impalaGetForeignRelSize(PlannerInfo *root,
 									RelOptInfo *baserel,
@@ -330,6 +334,331 @@ impala_fdw_validator(PG_FUNCTION_ARGS)
 	}
 
 	PG_RETURN_VOID();
+}
+
+/*
+ * Impala Kudu range-partition DDL via HS2. Whole-range ADD/DROP only
+ * (Kudu cannot drop a hash bucket or a partial slice). Guru: #SL.00000029.RANGEDDL
+ */
+static bool
+impala_sql_is_range_partition_stmt(const char *sql)
+{
+	char		buf[8192];
+	size_t		n = 0;
+	bool		in_space = true;
+	const char *p;
+
+	for (p = sql; *p != '\0' && n + 1 < sizeof(buf); p++)
+	{
+		unsigned char c = (unsigned char) *p;
+
+		if (isspace(c))
+		{
+			if (!in_space)
+			{
+				buf[n++] = ' ';
+				in_space = true;
+			}
+			continue;
+		}
+		buf[n++] = (char) pg_tolower(c);
+		in_space = false;
+	}
+	while (n > 0 && buf[n - 1] == ' ')
+		n--;
+	buf[n] = '\0';
+
+	if (strncmp(buf, "show range partitions ", 22) == 0)
+		return true;
+	if (strncmp(buf, "alter table ", 12) != 0)
+		return false;
+	return strstr(buf, " drop range partition ") != NULL ||
+		strstr(buf, " add range partition ") != NULL;
+}
+
+Datum
+impala_fdw_exec(PG_FUNCTION_ARGS)
+{
+	char	   *srvname = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char	   *sql = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	ForeignServer *server;
+	UserMapping *mapping;
+	List	   *options;
+	List	   *map_opts;
+	char	   *host;
+	char	   *port_str;
+	int			port;
+	char	   *auth;
+	char	   *krb_realm;
+	char	   *database;
+	char	   *map_principal;
+	char	   *map_keytab;
+	char	   *map_ccache;
+	const char *env_keytab;
+	char	   *principal;
+	char	   *keytab;
+	char	   *ccache;
+	bool		auth_kerberos;
+	char	   *err = NULL;
+	ImpalaHs2Session *sess = NULL;
+	ImpalaHs2Result *res = NULL;
+	StringInfoData out;
+	char	  **values = NULL;
+	bool	   *nulls = NULL;
+	int			nfields = 0;
+	int			rc;
+	int			rows = 0;
+
+	if (!impala_sql_is_range_partition_stmt(sql))
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("impala_fdw_exec: only ALTER TABLE … ADD/DROP RANGE PARTITION or SHOW RANGE PARTITIONS"),
+				 errdetail("Guru: #SL.00000029.RANGEDDL")));
+
+	server = GetForeignServerByName(srvname, false);
+	mapping = GetUserMapping(GetUserId(), server->serverid);
+	options = list_copy(server->options);
+	map_opts = list_copy(mapping->options);
+
+	host = get_option_value(options, OPTION_HOST);
+	if (host == NULL)
+		host = "127.0.0.1";
+	port_str = get_option_value(options, OPTION_PORT);
+	port = port_str ? atoi(port_str) : 21050;
+	auth = get_option_value(options, OPTION_AUTH);
+	if (auth == NULL)
+		auth = "kerberos";
+	krb_realm = get_option_value(options, OPTION_KRB_REALM);
+	database = get_option_value(options, OPTION_DATABASE);
+	if (database == NULL)
+		database = "default";
+	map_principal = get_option_value(map_opts, "principal");
+	map_keytab = get_option_value(map_opts, "keytab");
+	map_ccache = get_option_value(map_opts, "ccache");
+	auth_kerberos = (pg_strcasecmp(auth, "nosasl") != 0);
+	principal = impala_fdw_resolve_principal(map_principal, krb_realm,
+											 auth_kerberos);
+	env_keytab = impala_fdw_user_keytab_from_env();
+	if (map_keytab != NULL && map_keytab[0] != '\0')
+		keytab = map_keytab;
+	else if (env_keytab != NULL)
+		keytab = pstrdup(env_keytab);
+	else
+		keytab = NULL;
+	ccache = (map_ccache != NULL && map_ccache[0] != '\0') ? map_ccache : NULL;
+
+	sess = impala_hs2_connect_ex(host, port, auth, principal, database,
+								 keytab, ccache, &err);
+	if (sess == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
+				 errmsg("impala_fdw_exec: HS2 connect failed: %s",
+						err ? err : "unknown"),
+				 errdetail("Guru: #SL.00000029.RANGEDDL")));
+
+	res = impala_hs2_execute(sess, sql, &err);
+	if (res == NULL)
+	{
+		char	   *exec_err = err;
+		char		show_sql[512];
+		const char *tbl;
+		const char *p;
+		bool		is_drop = false;
+		bool		is_add = false;
+		char		value_tok[64];
+		bool		verified = false;
+		char		buf[8192];
+		size_t		n = 0;
+		bool		in_space = true;
+
+		impala_hs2_close(sess);
+		sess = NULL;
+		/*
+		 * Impala catalogd often closes the HS2 socket after Kudu ALTER
+		 * succeeds (TableLoadingException / TTransportException). Reconnect
+		 * and SHOW RANGE PARTITIONS; fail closed if the range is not actually
+		 * added or dropped. Guru: #SL.00000029.RANGEDDL
+		 */
+		if (exec_err == NULL ||
+			strstr(exec_err, "TableLoadingException") == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_ERROR),
+					 errmsg("impala_fdw_exec: %s",
+							exec_err ? exec_err : "execute failed"),
+					 errdetail("Guru: #SL.00000029.RANGEDDL")));
+
+		for (p = sql; *p && n + 1 < sizeof(buf); p++)
+		{
+			unsigned char c = (unsigned char) *p;
+
+			if (isspace(c))
+			{
+				if (!in_space)
+				{
+					buf[n++] = ' ';
+					in_space = true;
+				}
+				continue;
+			}
+			buf[n++] = (char) pg_tolower(c);
+			in_space = false;
+		}
+		buf[n] = '\0';
+		is_drop = strstr(buf, " drop range partition ") != NULL;
+		is_add = strstr(buf, " add range partition ") != NULL;
+		tbl = strstr(buf, "alter table ");
+		value_tok[0] = '\0';
+		if (tbl)
+		{
+			const char *name = tbl + strlen("alter table ");
+			const char *end = strstr(name, " add range partition ");
+			const char *end2 = strstr(name, " drop range partition ");
+			size_t		nlen;
+			char		tname[256];
+			const char *v;
+
+			if (end == NULL || (end2 && end2 < end))
+				end = end2;
+			nlen = end ? (size_t) (end - name) : strlen(name);
+			if (nlen >= sizeof(tname))
+				nlen = sizeof(tname) - 1;
+			memcpy(tname, name, nlen);
+			tname[nlen] = '\0';
+			while (nlen > 0 && tname[nlen - 1] == ' ')
+				tname[--nlen] = '\0';
+			snprintf(show_sql, sizeof(show_sql),
+					 "SHOW RANGE PARTITIONS %s", tname);
+			v = strstr(buf, "value = ");
+			if (v)
+			{
+				v += 8;
+				nlen = 0;
+				while (v[nlen] && (isdigit((unsigned char) v[nlen]) ||
+								   v[nlen] == '-'))
+					nlen++;
+				if (nlen > 0 && nlen < sizeof(value_tok))
+				{
+					memcpy(value_tok, v, nlen);
+					value_tok[nlen] = '\0';
+				}
+			}
+		}
+		else
+			show_sql[0] = '\0';
+
+		if (show_sql[0] == '\0' || (!is_drop && !is_add))
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_ERROR),
+					 errmsg("impala_fdw_exec: %s", exec_err),
+					 errdetail("Guru: #SL.00000029.RANGEDDL")));
+
+		sess = impala_hs2_connect_ex(host, port, auth, principal, database,
+									 keytab, ccache, &err);
+		if (sess == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
+					 errmsg("impala_fdw_exec: HS2 reconnect after ALTER failed: %s",
+							err ? err : exec_err),
+					 errdetail("Guru: #SL.00000029.RANGEDDL")));
+		res = impala_hs2_execute(sess, show_sql, &err);
+		if (res == NULL)
+		{
+			impala_hs2_close(sess);
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_ERROR),
+					 errmsg("impala_fdw_exec: SHOW RANGE after ALTER failed: %s",
+							err ? err : exec_err),
+					 errdetail("Guru: #SL.00000029.RANGEDDL")));
+		}
+		initStringInfo(&out);
+		for (;;)
+		{
+			rc = impala_hs2_fetch_row(res, &values, &nfields, &nulls, &err);
+			if (rc < 0)
+			{
+				impala_hs2_close_result(res);
+				impala_hs2_close(sess);
+				ereport(ERROR,
+						(errcode(ERRCODE_FDW_ERROR),
+						 errmsg("impala_fdw_exec: fetch SHOW RANGE failed: %s",
+								err ? err : "unknown"),
+						 errdetail("Guru: #SL.00000029.RANGEDDL")));
+			}
+			if (rc == 0)
+				break;
+			if (out.len > 0)
+				appendStringInfoChar(&out, '\n');
+			for (int i = 0; i < nfields; i++)
+			{
+				if (i > 0)
+					appendStringInfoChar(&out, '\t');
+				if (nulls != NULL && nulls[i])
+					appendStringInfoString(&out, "NULL");
+				else if (values != NULL && values[i] != NULL)
+					appendStringInfoString(&out, values[i]);
+			}
+			impala_hs2_free_row(values, nulls, nfields);
+		}
+		impala_hs2_close_result(res);
+		impala_hs2_close(sess);
+		if (value_tok[0] != '\0')
+		{
+			char		needle[80];
+
+			snprintf(needle, sizeof(needle), "VALUE = %s", value_tok);
+			verified = strstr(out.data, needle) != NULL;
+			if (is_drop)
+				verified = !verified;
+		}
+		if (!verified)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_ERROR),
+					 errmsg("impala_fdw_exec: ALTER RANGE did not verify via SHOW RANGE PARTITIONS"),
+					 errdetail("%s\n%s", exec_err, out.data)));
+		{
+			char	   *msg = psprintf("OK (verified SHOW RANGE PARTITIONS after Impala catalog reload fault)\n%s",
+									   out.data);
+
+			PG_RETURN_TEXT_P(cstring_to_text(msg));
+		}
+	}
+
+	initStringInfo(&out);
+	for (;;)
+	{
+		rc = impala_hs2_fetch_row(res, &values, &nfields, &nulls, &err);
+		if (rc < 0)
+		{
+			impala_hs2_close_result(res);
+			impala_hs2_close(sess);
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_ERROR),
+					 errmsg("impala_fdw_exec: fetch failed: %s",
+							err ? err : "unknown"),
+					 errdetail("Guru: #SL.00000029.RANGEDDL")));
+		}
+		if (rc == 0)
+			break;
+		if (rows > 0)
+			appendStringInfoChar(&out, '\n');
+		for (int i = 0; i < nfields; i++)
+		{
+			if (i > 0)
+				appendStringInfoChar(&out, '\t');
+			if (nulls != NULL && nulls[i])
+				appendStringInfoString(&out, "NULL");
+			else if (values != NULL && values[i] != NULL)
+				appendStringInfoString(&out, values[i]);
+		}
+		impala_hs2_free_row(values, nulls, nfields);
+		rows++;
+	}
+	impala_hs2_close_result(res);
+	impala_hs2_close(sess);
+
+	if (out.len == 0)
+		appendStringInfoString(&out, "OK");
+	PG_RETURN_TEXT_P(cstring_to_text(out.data));
 }
 
 static char *

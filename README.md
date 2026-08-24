@@ -1,7 +1,7 @@
 # impala_fdw
 
-PostgreSQL foreign data wrapper for **Apache Impala** (HS2), scoped to **Kudu
-storage only**.
+PostgreSQL foreign data wrapper for **Apache Impala** (HS2): **Kudu** hot
+tier (`kudu_scan` INSERT/scan) and **Iceberg** cold tier (`impala_sql`).
 
 Part of the [signals-360](https://github.com/weathership/signals) stack: query
 **Kudu tables** (via Impala HS2) from Postgres so AGE graph / governance SQL can
@@ -9,10 +9,11 @@ join the hot data plane without copying bulk data into Postgres.
 
 ## Storage scope
 
-| In scope | Out of scope (v1) |
+| In scope | Out of scope |
 |----------|-------------------|
-| Impala tables stored on **Kudu** | Iceberg / Parquet / other Impala table formats |
-| Read path through HS2 | Direct Kudu C++ client (optional later) |
+| Kudu hot tables (`kudu_scan` + HS2) | Parquet/ORC/HDFS that is not Iceberg cold |
+| Iceberg cold + UNION views (`impala_sql`) | INSERT over `impala_sql` / Iceberg |
+| `DROP RANGE PARTITION` via `impala_fdw_exec` | Dropping a hash bucket or a partial range slice |
 
 Impala is the **query frontend** (HS2); Kudu is the only **storage backend** we
 need to support for foreign tables.

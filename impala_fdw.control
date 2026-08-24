@@ -1,5 +1,5 @@
 # impala_fdw extension
-comment = 'Foreign Data Wrapper for Impala HS2 (Kudu storage only)'
-default_version = '0.1.0'
+comment = 'Foreign Data Wrapper for Impala HS2 (Kudu hot + Iceberg cold)'
+default_version = '0.1.1'
 module_pathname = '$libdir/impala_fdw'
 relocatable = true

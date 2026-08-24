@@ -1,7 +1,7 @@
 # impala_fdw specification
 
 **Status:** Draft v0.5 (binding intent for implementation)  
-**Storage scope:** Kudu-backed Impala tables only  
+**Storage scope:** Kudu hot tier + Iceberg cold tier (Impala UNION views)  
 **Implementation language:** **C/C++** (PostgreSQL FDW + libkudu_client + HS2 thrift client)—no Java runtime in the extension process  
 **Tenancy:** **Single-tenant / governance-plane** (no multi-tenant isolation inside the FDW)  
 **Identity:** **Kerberos is the expected identity plane for all signals users** of this stack  
@@ -17,15 +17,16 @@
 - **Specialized paths:** For the **closed Atlas + Ranger + AGE + sigint** query algebra, the extension may execute **direct Kudu client** scans when that is faster and semantically equivalent—without exposing a second FDW product.
 - **Native stack:** Executors and clients are **C/C++**, matching Impala/Kudu’s native libraries and PostgreSQL’s FDW ABI—avoid JVM bridges in-process.
 
-Postgres remains the primary front end for graph/governance SQL. Kudu remains the only storage backend in scope. Impala is the default SQL adapter and the escape hatch for ad-hoc / multi-table SQL.
+Postgres remains the primary front end for graph/governance SQL. Impala is the default SQL adapter across **Kudu (hot)** and **Iceberg (cold)**. Direct `kudu_scan` stays the write/fast path for Kudu-backed tables.
 
 ```
 PostgreSQL (:5455)
   ├─ AGE / Atlas graph (atlas_graph)
   ├─ signals_catalog (HMS-free registry)
   └─ impala_fdw
-        ├─ path: impala_sql  ──HS2──► Impala (:21050) ──► Kudu (:7051)
-        └─ path: kudu_scan   ──────────Kudu client──────► Kudu (:7051)
+        ├─ path: impala_sql  ──HS2──► Impala (:21050) ──► Kudu ∪ Iceberg
+        ├─ path: kudu_scan   ──────────Kudu client──────► Kudu (:7051)
+        └─ impala_fdw_exec   ──HS2──► ALTER TABLE … ADD/DROP RANGE PARTITION
 ```
 
 ## 2. Goals
@@ -33,12 +34,13 @@ PostgreSQL (:5455)
 | ID | Goal |
 |----|------|
 | G1 | Read Kudu table data from Postgres via foreign tables / foreign scans |
-| G11 | INSERT (UPSERT) Kudu rows through `kudu_scan` foreign tables so Gaius engine warehouse ingest exercises the FDW write path |
+| G11 | INSERT (UPSERT) Kudu rows through `kudu_scan` foreign tables so Gaius engine warehouse ingest is the only writer |
+| G12 | Expire closed Kudu hours with Impala `ALTER TABLE … DROP RANGE PARTITION` (whole range, all hash buckets); never row DELETE or partial-slice drops |
 | G2 | Prefer Impala HS2 for general SQL-shaped queries (joins, complex predicates, partner demos) |
 | G3 | Recognize governance/sigint scan shapes and run them on a **Kudu fast path** when safe |
 | G4 | Single extension, single type-mapping layer, dual executors |
 | G5 | Align with signals devenv: PG 16 :5455, Impala HS2 :21050, Kudu masters :7051, realm `DEV.VISTA.ZNDX.ORG` |
-| G6 | Kudu storage only—no Iceberg / HDFS / other Impala formats in v1 |
+| G6 | Kudu hot + Iceberg cold: `impala_sql` reads UNION views; `kudu_scan` writes/scans Kudu |
 | G7 | **C/C++ only** for extension code and remote clients (PGXS, libkudu_client, HS2 thrift/C++) |
 | G8 | **Kerberos as a first-class identity path** for Impala HS2 and Kudu (aligned with signals KDC), even if rollout is phased |
 | G9 | Interoperate cleanly with **PostgreSQL RLS** and standard PG privilege patterns (USAGE/SELECT on foreign tables)—without multi-tenant FDW logic |
@@ -49,7 +51,7 @@ PostgreSQL (:5455)
 | ID | Non-goal |
 |----|----------|
 | N1 | Full general-purpose BI FDW (arbitrary Impala SQL dialects beyond pushed scans) |
-| N2 | Iceberg or multi-format Impala tables |
+| N2 | Parquet/ORC/HDFS Impala tables that are not the Iceberg cold tier |
 | N3 | UPDATE/DELETE (and INSERT over `impala_sql` / HS2) — INSERT is in-scope for `kudu_scan` only (G11, v0.5) |
 | N4 | Replacing Atlas REST, AGE schema, or Ranger policy evaluation engines |
 | N5 | Running Hive Metastore or standalone HiveServer2 |
@@ -65,12 +67,13 @@ PostgreSQL (:5455)
 3. **Semantic equivalence** — For any promoted shape, Kudu path results must match Impala path results under the test suite (same projection, filter, row set modulo ordering unless ORDER BY pushed).
 4. **One type system** — Impala/Kudu/Postgres type mapping lives in one module used by both executors.
 5. **Explainability** — `EXPLAIN` / `EXPLAIN (VERBOSE)` must show which access method was chosen and why (or a shape id).
-6. **Fail closed on storage** — If a foreign table is not Kudu-backed, create/import or first scan errors clearly.
+6. **Fail closed on storage** — `kudu_scan` requires a Kudu table. `impala_sql` may read Iceberg and UNION views. Unknown formats error. Expire with `DROP RANGE PARTITION` only.
 7. **C/C++ native** — Prefer linking official/native clients; no JVM in the backend process.
 8. **Kerberos-first identity model** — Design options, user mapping, and connection setup for Kerberos from day one; `nosasl` is a devenv convenience, not the long-term default story.
 9. **Postgres-native access control** — Rely on PG roles, GRANT, and RLS on foreign tables / wrapping views; FDW does not invent tenants.
 10. **One principal end-to-end** — When the client authenticates to Postgres with GSSAPI, the FDW should authenticate to Impala/Kudu as **that same Kerberos principal** (not a fixed service keytab), using ticket cache / delegation patterns where the platform supports them.
-11. **INSERT through the FDW** — Gaius engine warehouse ingest writes `INSERT INTO gpu_metrics_tier0` on Postgres (`kudu_scan`). `gpu_metrics` is the HS2 UNION view of hot Kudu ∪ cold Iceberg and is not writable (N3). No silent C++ sidecar writer.
+11. **INSERT through the FDW** — Gaius engine warehouse ingest writes `INSERT INTO gpu_metrics_tier0` on Postgres (`kudu_scan`). `gpu_metrics` is the HS2 UNION view of hot Kudu ∪ cold Iceberg and is not writable (N3). No sidecar writer.
+12. **Range-partition expire** — Closed hot hours leave via `ALTER TABLE … DROP RANGE PARTITION <lo> <= VALUES < <hi>` through `impala_fdw_exec` (Impala SQL). That drops every tablet in the range, including all hash buckets. Kudu cannot drop a hash bucket or a partial slice.
 
 ## 5. Objects and options
 
