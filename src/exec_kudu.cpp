@@ -174,7 +174,11 @@ type_supported(KuduColumnSchema::DataType t)
 	{
 		case KuduColumnSchema::BOOL:
 		case KuduColumnSchema::INT8:
+		case KuduColumnSchema::INT16:
+		case KuduColumnSchema::INT32:
 		case KuduColumnSchema::INT64:
+		case KuduColumnSchema::FLOAT:
+		case KuduColumnSchema::DOUBLE:
 		case KuduColumnSchema::STRING:
 		case KuduColumnSchema::BINARY:
 			return true;
@@ -211,10 +215,46 @@ cell_to_pg_string(const KuduScanBatch::RowPtr &row, int col_idx,
 			*out = std::to_string(static_cast<int>(v));
 			return Status::OK();
 		}
+		case KuduColumnSchema::INT16:
+		{
+			int16_t v = 0;
+			Status st = row.GetInt16(col_idx, &v);
+			if (!st.ok())
+				return st;
+			*out = std::to_string(static_cast<int>(v));
+			return Status::OK();
+		}
+		case KuduColumnSchema::INT32:
+		{
+			int32_t v = 0;
+			Status st = row.GetInt32(col_idx, &v);
+			if (!st.ok())
+				return st;
+			*out = std::to_string(v);
+			return Status::OK();
+		}
 		case KuduColumnSchema::INT64:
 		{
 			int64_t v = 0;
 			Status st = row.GetInt64(col_idx, &v);
+			if (!st.ok())
+				return st;
+			*out = std::to_string(v);
+			return Status::OK();
+		}
+		case KuduColumnSchema::FLOAT:
+		{
+			float v = 0;
+			Status st = row.GetFloat(col_idx, &v);
+			if (!st.ok())
+				return st;
+			*out = std::to_string(v);
+			return Status::OK();
+		}
+		case KuduColumnSchema::DOUBLE:
+		{
+			double v = 0;
+			Status st = row.GetDouble(col_idx, &v);
 			if (!st.ok())
 				return st;
 			*out = std::to_string(v);
