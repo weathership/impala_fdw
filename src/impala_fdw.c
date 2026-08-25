@@ -13,6 +13,8 @@
  */
 #include "postgres.h"
 
+#include "utils/numeric.h"
+
 #include <ctype.h>
 
 #include "access/htup_details.h"
@@ -2232,6 +2234,18 @@ impalaExecForeignInsert(EState *estate,
 				case BOOLOID:
 					cells[i].i64 = DatumGetBool(d) ? 1 : 0;
 					break;
+				case NUMERICOID:
+					{
+						/* Exact decimal text; exec_kudu rescales to the Kudu
+						 * column scale and refuses a value that would not be
+						 * exact there. Mirrors the predicate path (pack_const). */
+						char	   *s = DatumGetCString(
+							DirectFunctionCall1(numeric_out, d));
+
+						cells[i].ptr = s;
+						cells[i].len = (int) strlen(s);
+						break;
+					}
 				case TEXTOID:
 				case VARCHAROID:
 					{

@@ -104,7 +104,7 @@ typedef struct ImpalaKuduCell
 	int				isnull;
 	int64_t			i64;
 	double			f8;
-	const char	   *ptr;
+	const char	   *ptr;		/* NUMERIC: exact decimal text (numeric_out) */
 	int				len;
 } ImpalaKuduCell;
 

@@ -98,6 +98,7 @@ struct ImpalaKuduModify
 	int ncolumns;
 	std::vector<std::string> col_names;
 	std::vector<KuduColumnSchema::DataType> col_types;
+	std::vector<int8_t> col_scales;	/* DECIMAL columns only; 0 otherwise */
 	int pending;
 };
 
@@ -2165,6 +2166,8 @@ impala_kudu_modify_open_inner(const char *masters,
 			KuduColumnSchema col = schema.Column(static_cast<size_t>(i));
 			m->col_names.push_back(col.name());
 			m->col_types.push_back(col.type());
+			m->col_scales.push_back(col.type() == KuduColumnSchema::DECIMAL
+										? col.type_attributes().scale() : 0);
 		}
 	}
 	else
@@ -2192,6 +2195,8 @@ impala_kudu_modify_open_inner(const char *masters,
 			KuduColumnSchema col = schema.Column(static_cast<size_t>(found));
 			m->col_names.push_back(col.name());
 			m->col_types.push_back(col.type());
+			m->col_scales.push_back(col.type() == KuduColumnSchema::DECIMAL
+										? col.type_attributes().scale() : 0);
 		}
 	}
 	return m;
@@ -2220,12 +2225,42 @@ impala_kudu_modify_open(const char *masters,
 
 static Status
 set_cell(kudu::KuduPartialRow *row, const std::string &name,
-		 KuduColumnSchema::DataType dtype, const ImpalaKuduCell &cell)
+		 KuduColumnSchema::DataType dtype, int8_t scale,
+		 const ImpalaKuduCell &cell)
 {
 	if (cell.isnull)
 		return row->SetNull(name);
 	switch (dtype)
 	{
+		case KuduColumnSchema::DECIMAL:
+		{
+			/*
+			 * NUMERIC arrives as exact decimal text (numeric_out), same as the
+			 * predicate path. A write must be exact: rescale to the column
+			 * scale and refuse rather than round if the value does not land on
+			 * the scale. dec_parse/dec_bounds are the predicate helpers; F==C
+			 * iff the constant is representable at 'scale'.
+			 */
+			if (cell.type_oid != 1700 /* NUMERICOID */)
+				return Status::InvalidArgument(
+					"DECIMAL column needs a numeric value");
+			__int128 unscaled = 0, F = 0, C = 0, maxv = 0;
+			int cscale = 0;
+			std::string derr;
+			int len = cell.len > 0 ? cell.len
+								   : (cell.ptr ? (int) strlen(cell.ptr) : 0);
+			if (!dec_parse(cell.ptr, len, &unscaled, &cscale, &derr))
+				return Status::InvalidArgument(derr);
+			if (!dec_bounds(unscaled, cscale, scale, &F, &C, &derr))
+				return Status::InvalidArgument(derr);
+			if (F != C)
+				return Status::InvalidArgument(
+					std::string("value ") +
+					std::string(cell.ptr, (size_t) len) +
+					" is not exact at the column scale; normalise before INSERT");
+			(void) maxv;
+			return row->SetUnscaledDecimal(name, F);
+		}
 		case KuduColumnSchema::INT8:
 			return row->SetInt8(name, static_cast<int8_t>(cell.i64));
 		case KuduColumnSchema::INT16:
@@ -2285,7 +2320,8 @@ impala_kudu_modify_upsert(ImpalaKuduModify *m,
 		for (int i = 0; i < nfields; i++)
 		{
 			st = set_cell(row, m->col_names[static_cast<size_t>(i)],
-						  m->col_types[static_cast<size_t>(i)], cells[i]);
+						  m->col_types[static_cast<size_t>(i)],
+						  m->col_scales[static_cast<size_t>(i)], cells[i]);
 			if (!st.ok())
 			{
 				delete up;
