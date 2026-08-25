@@ -973,17 +973,425 @@ dec_open_scans(const std::string &cache_key)
 /* Find column type by name; false if missing. */
 static bool
 lookup_col_type(const KuduSchema &schema, const std::string &name,
-				KuduColumnSchema::DataType *out)
+				KuduColumnSchema::DataType *out,
+				int8_t *precision, int8_t *scale)
 {
 	for (size_t ci = 0; ci < schema.num_columns(); ci++)
 	{
 		if (schema.Column(ci).name() == name)
 		{
-			*out = schema.Column(ci).type();
+			const KuduColumnSchema &c = schema.Column(ci);
+
+			*out = c.type();
+			/*
+			 * DECIMAL is an unscaled integer plus (precision, scale) held on
+			 * the column, not the value -- the predicate path needs both to
+			 * rescale a constant, so surface them here rather than reopening
+			 * the schema at each call site.
+			 */
+			if (precision != NULL && scale != NULL &&
+				c.type() == KuduColumnSchema::DECIMAL)
+			{
+				*precision = c.type_attributes().precision();
+				*scale = c.type_attributes().scale();
+			}
 			return true;
 		}
 	}
 	return false;
+}
+
+
+/*
+ * ---------------------------------------------------------------------------
+ * DECIMAL predicate support.
+ *
+ * Kudu stores DECIMAL as an unscaled integer at a scale fixed by the column.
+ * kudu_pred.c ships the constant as exact decimal TEXT because the PG side
+ * cannot see the Kudu scale; the rescale happens here against the schema.
+ *
+ * Correctness note: impala_fdw does NOT recheck remote quals locally
+ * (GetForeignPlan puts an expr in remote_exprs XOR local_exprs), so a bound
+ * that is off by one ulp yields WRONG ROWS, not merely slow ones. When the
+ * constant is not representable at the column scale, the bound must therefore
+ * be rounded in the direction that preserves the predicate's meaning:
+ *
+ *   with F = floor(c * 10^scale), C = ceil(c * 10^scale)
+ *
+ *     col >  c   ->   col >  F        col >= c   ->   col >= C
+ *     col <  c   ->   col <  C        col <= c   ->   col <= F
+ *     col =  c   ->   col =  F  only when F == C, else matches nothing
+ *
+ * Both > and <= take F; both >= and < take C. That holds whether or not c is
+ * representable, which is why no separate representable/not branch is needed
+ * for the inequalities.
+ * ---------------------------------------------------------------------------
+ */
+
+/* Largest magnitude an int128 can hold; decimal precision caps at 38 digits. */
+static const int kDecMaxDigits = 38;
+
+static bool
+dec_pow10(int e, __int128 *out)
+{
+	__int128 r = 1;
+
+	if (e < 0 || e > kDecMaxDigits)
+		return false;
+	for (int i = 0; i < e; i++)
+		r *= 10;
+	*out = r;
+	return true;
+}
+
+/* 10^precision - 1: the largest unscaled magnitude the column can store. */
+static bool
+dec_col_max(int8_t precision, __int128 *out)
+{
+	__int128 p;
+
+	if (!dec_pow10(static_cast<int>(precision), &p))
+		return false;
+	*out = p - 1;
+	return true;
+}
+
+/*
+ * Parse exact decimal text into (unscaled, scale) with value = unscaled*10^-scale.
+ * Accepts optional sign, digits, one '.', and an optional exponent. Rejects
+ * anything else -- NaN/Inf are already refused in kudu_pred.c.
+ */
+static bool
+dec_parse(const char *s, int len, __int128 *unscaled, int *scale,
+		  std::string *err)
+{
+	int			i = 0;
+	bool		neg = false;
+	bool		seen_dot = false;
+	bool		seen_digit = false;
+	int			frac = 0;
+	int			digits = 0;
+	int			exp = 0;
+	__int128	mant = 0;
+
+	if (s == NULL || len <= 0)
+	{
+		*err = "empty decimal constant";
+		return false;
+	}
+	while (i < len && (s[i] == ' ' || s[i] == '\t'))
+		i++;
+	if (i < len && (s[i] == '+' || s[i] == '-'))
+	{
+		neg = (s[i] == '-');
+		i++;
+	}
+	for (; i < len; i++)
+	{
+		char		ch = s[i];
+
+		if (ch == '.')
+		{
+			if (seen_dot)
+			{
+				*err = "malformed decimal constant";
+				return false;
+			}
+			seen_dot = true;
+			continue;
+		}
+		if (ch == 'e' || ch == 'E')
+			break;
+		if (ch < '0' || ch > '9')
+		{
+			*err = std::string("malformed decimal constant: ") +
+				std::string(s, static_cast<size_t>(len));
+			return false;
+		}
+		seen_digit = true;
+		/*
+		 * Leading zeros carry no significance and must not consume the digit
+		 * budget, else '0.000000001' would be refused at 38 digits.
+		 */
+		if (mant == 0 && ch == '0')
+		{
+			if (seen_dot)
+				frac++;
+			continue;
+		}
+		if (digits >= kDecMaxDigits)
+		{
+			*err = "decimal constant exceeds 38 significant digits";
+			return false;
+		}
+		mant = mant * 10 + (ch - '0');
+		digits++;
+		if (seen_dot)
+			frac++;
+	}
+	if (!seen_digit)
+	{
+		*err = "malformed decimal constant";
+		return false;
+	}
+	if (i < len && (s[i] == 'e' || s[i] == 'E'))
+	{
+		bool		eneg = false;
+		bool		edig = false;
+
+		i++;
+		if (i < len && (s[i] == '+' || s[i] == '-'))
+		{
+			eneg = (s[i] == '-');
+			i++;
+		}
+		for (; i < len; i++)
+		{
+			if (s[i] < '0' || s[i] > '9')
+			{
+				*err = "malformed decimal exponent";
+				return false;
+			}
+			edig = true;
+			exp = exp * 10 + (s[i] - '0');
+			if (exp > 1000)
+			{
+				*err = "decimal exponent out of range";
+				return false;
+			}
+		}
+		if (!edig)
+		{
+			*err = "malformed decimal exponent";
+			return false;
+		}
+		if (eneg)
+			exp = -exp;
+	}
+	*unscaled = neg ? -mant : mant;
+	*scale = frac - exp;
+	return true;
+}
+
+/*
+ * Rescale (unscaled, cscale) to the column scale, returning floor and ceil of
+ * the exact value * 10^col_scale. F == C exactly when the constant is
+ * representable at col_scale.
+ */
+static bool
+dec_bounds(__int128 unscaled, int cscale, int8_t col_scale,
+		   __int128 *F, __int128 *C, std::string *err)
+{
+	int			shift = static_cast<int>(col_scale) - cscale;
+
+	if (shift >= 0)
+	{
+		__int128	m;
+		__int128	lim;
+
+		if (!dec_pow10(shift, &m))
+		{
+			*err = "decimal rescale out of range";
+			return false;
+		}
+		/*
+		 * Guard the widening multiply before it wraps. Shift as UNSIGNED:
+		 * ~(__int128)0 is -1, and >> on a negative signed value is an
+		 * arithmetic shift that stays -1, which would reject every constant.
+		 */
+		lim = static_cast<__int128>(
+			(~static_cast<unsigned __int128>(0)) >> 1);	/* INT128_MAX */
+		if (m != 0 && unscaled != 0)
+		{
+			__int128	mag = unscaled < 0 ? -unscaled : unscaled;
+
+			if (mag > lim / m)
+			{
+				*err = "decimal constant too large to rescale";
+				return false;
+			}
+		}
+		*F = *C = unscaled * m;
+		return true;
+	}
+	else
+	{
+		__int128	d;
+		__int128	q;
+		__int128	r;
+
+		if (!dec_pow10(-shift, &d))
+		{
+			/*
+			 * The constant has far more fractional digits than the column
+			 * keeps; its magnitude rounds to zero at col_scale.
+			 */
+			*F = (unscaled < 0) ? -1 : 0;
+			*C = (unscaled > 0) ? 1 : 0;
+			return true;
+		}
+		q = unscaled / d;		/* C++ truncates toward zero */
+		r = unscaled % d;
+		if (r == 0)
+			*F = *C = q;
+		else if (unscaled > 0)
+		{
+			*F = q;
+			*C = q + 1;
+		}
+		else
+		{
+			*F = q - 1;
+			*C = q;
+		}
+		return true;
+	}
+}
+
+/*
+ * Build the (op, value) pair for a DECIMAL comparison, adjusting the operator
+ * when the constant is not representable or falls outside the column range.
+ *
+ * Out-of-range and non-representable equality are expressed as predicates that
+ * are trivially false or trivially true rather than as errors, because
+ * `WHERE d = 1.2345678901` on DECIMAL(18,6) is a legitimate query that must
+ * return zero rows -- and because silently dropping the predicate would return
+ * a superset that nothing downstream rechecks.
+ *
+ *   always false : col >  MAX      (no stored value exceeds MAX)
+ *   always true  : col >= -MAX     (matches every non-NULL, like any
+ *                                   comparison, so NULL semantics are kept)
+ */
+static Status
+make_decimal_value(const ImpalaKuduPred *pred, int vidx,
+				   int8_t precision, int8_t scale,
+				   KuduPredicate::ComparisonOp in_op,
+				   KuduPredicate::ComparisonOp *out_op,
+				   KuduValue **out)
+{
+	const char *txt = static_cast<const char *>(pred->value_ptrs[vidx]);
+	int			len = pred->value_lens ? pred->value_lens[vidx] : 0;
+	__int128	unscaled = 0;
+	__int128	F = 0;
+	__int128	C = 0;
+	__int128	maxv = 0;
+	int			cscale = 0;
+	std::string err;
+
+	if (pred->value_type != 1700 /* NUMERICOID */)
+		return Status::InvalidArgument(
+			"DECIMAL column needs a numeric constant");
+	if (len <= 0)
+		len = txt ? static_cast<int>(strlen(txt)) : 0;
+	if (!dec_parse(txt, len, &unscaled, &cscale, &err))
+		return Status::InvalidArgument(err);
+	if (!dec_col_max(precision, &maxv))
+		return Status::InvalidArgument("unsupported DECIMAL precision");
+	if (!dec_bounds(unscaled, cscale, scale, &F, &C, &err))
+		return Status::InvalidArgument(err);
+
+	/* Constant sits entirely above or below everything the column can hold. */
+	if (F > maxv)
+	{
+		if (in_op == KuduPredicate::LESS || in_op == KuduPredicate::LESS_EQUAL)
+		{
+			*out_op = KuduPredicate::GREATER_EQUAL;
+			*out = KuduValue::FromDecimal(-maxv, scale);
+		}
+		else
+		{
+			*out_op = KuduPredicate::GREATER;
+			*out = KuduValue::FromDecimal(maxv, scale);
+		}
+		return Status::OK();
+	}
+	if (C < -maxv)
+	{
+		if (in_op == KuduPredicate::GREATER ||
+			in_op == KuduPredicate::GREATER_EQUAL)
+		{
+			*out_op = KuduPredicate::GREATER_EQUAL;
+			*out = KuduValue::FromDecimal(-maxv, scale);
+		}
+		else
+		{
+			*out_op = KuduPredicate::GREATER;
+			*out = KuduValue::FromDecimal(maxv, scale);
+		}
+		return Status::OK();
+	}
+
+	switch (in_op)
+	{
+		case KuduPredicate::EQUAL:
+			if (F != C)
+			{
+				/* Not representable at this scale: nothing can equal it. */
+				*out_op = KuduPredicate::GREATER;
+				*out = KuduValue::FromDecimal(maxv, scale);
+				return Status::OK();
+			}
+			*out_op = KuduPredicate::EQUAL;
+			*out = KuduValue::FromDecimal(F, scale);
+			return Status::OK();
+		case KuduPredicate::GREATER:
+			*out_op = KuduPredicate::GREATER;
+			*out = KuduValue::FromDecimal(F, scale);
+			return Status::OK();
+		case KuduPredicate::GREATER_EQUAL:
+			*out_op = KuduPredicate::GREATER_EQUAL;
+			*out = KuduValue::FromDecimal(C, scale);
+			return Status::OK();
+		case KuduPredicate::LESS:
+			*out_op = KuduPredicate::LESS;
+			*out = KuduValue::FromDecimal(C, scale);
+			return Status::OK();
+		case KuduPredicate::LESS_EQUAL:
+			*out_op = KuduPredicate::LESS_EQUAL;
+			*out = KuduValue::FromDecimal(F, scale);
+			return Status::OK();
+		default:
+			return Status::InvalidArgument("bad DECIMAL comparison op");
+	}
+}
+
+/*
+ * IN-list member. A value that is not representable at the column scale can
+ * never equal a stored value, so it is reported non-representable and dropped
+ * by the caller rather than rounded into a neighbour it does not mean.
+ */
+static Status
+make_decimal_in_value(const ImpalaKuduPred *pred, int vidx,
+					  int8_t precision, int8_t scale,
+					  KuduValue **out, bool *representable)
+{
+	const char *txt = static_cast<const char *>(pred->value_ptrs[vidx]);
+	int			len = pred->value_lens ? pred->value_lens[vidx] : 0;
+	__int128	unscaled = 0;
+	__int128	F = 0;
+	__int128	C = 0;
+	__int128	maxv = 0;
+	int			cscale = 0;
+	std::string err;
+
+	*representable = false;
+	*out = NULL;
+	if (pred->value_type != 1700 /* NUMERICOID */)
+		return Status::InvalidArgument(
+			"DECIMAL column needs a numeric constant");
+	if (len <= 0)
+		len = txt ? static_cast<int>(strlen(txt)) : 0;
+	if (!dec_parse(txt, len, &unscaled, &cscale, &err))
+		return Status::InvalidArgument(err);
+	if (!dec_col_max(precision, &maxv))
+		return Status::InvalidArgument("unsupported DECIMAL precision");
+	if (!dec_bounds(unscaled, cscale, scale, &F, &C, &err))
+		return Status::InvalidArgument(err);
+	if (F != C || F > maxv || F < -maxv)
+		return Status::OK();	/* representable stays false */
+	*representable = true;
+	*out = KuduValue::FromDecimal(F, scale);
+	return Status::OK();
 }
 
 /*
@@ -1093,8 +1501,10 @@ make_kudu_value(const ImpalaKuduPred *pred, int vidx,
 			return Status::NotSupported(
 				"Kudu 1D ARRAY columns cannot be used as kudu_scan predicates");
 		case KuduColumnSchema::DECIMAL:
-			return Status::NotSupported(
-				"DECIMAL predicates on kudu_scan are not implemented");
+			/* Handled by make_decimal_value()/make_decimal_in_value(), which
+			 * need the column scale and may rewrite the comparison op. */
+			return Status::InvalidArgument(
+				"DECIMAL must go through make_decimal_value");
 		default:
 			return Status::NotSupported(
 				std::string("unsupported Kudu type for predicate: ") +
@@ -1119,8 +1529,11 @@ apply_predicates(KuduTable *table, KuduScanner *scanner,
 
 		std::string col(p.column);
 		KuduColumnSchema::DataType dtype;
-		if (!lookup_col_type(schema, col, &dtype))
+		int8_t		dec_precision = 0;
+		int8_t		dec_scale = 0;
+		if (!lookup_col_type(schema, col, &dtype, &dec_precision, &dec_scale))
 			return Status::NotFound(std::string("column not found: ") + col);
+		bool		is_dec = (dtype == KuduColumnSchema::DECIMAL);
 
 		KuduPredicate *kpred = NULL;
 
@@ -1141,7 +1554,19 @@ apply_predicates(KuduTable *table, KuduScanner *scanner,
 				for (int v = 0; v < p.nvalues; v++)
 				{
 					KuduValue *kv = NULL;
-					Status st = make_kudu_value(&p, v, dtype, &kv);
+					Status st;
+
+					if (is_dec)
+					{
+						bool		ok = false;
+
+						st = make_decimal_in_value(&p, v, dec_precision,
+												   dec_scale, &kv, &ok);
+						if (st.ok() && !ok)
+							continue;	/* cannot equal any stored value */
+					}
+					else
+						st = make_kudu_value(&p, v, dtype, &kv);
 					if (!st.ok())
 					{
 						for (auto *x : values)
@@ -1149,6 +1574,24 @@ apply_predicates(KuduTable *table, KuduScanner *scanner,
 						return st;
 					}
 					values.push_back(kv);
+				}
+				if (values.empty())
+				{
+					/*
+					 * Every member was unrepresentable at the column scale, so
+					 * the IN matches nothing. Emit a trivially-false predicate
+					 * rather than dropping it -- remote quals are not rechecked
+					 * locally, so an absent predicate would return every row.
+					 */
+					__int128	maxv = 0;
+
+					if (!dec_col_max(dec_precision, &maxv))
+						return Status::InvalidArgument(
+							"unsupported DECIMAL precision");
+					kpred = table->NewComparisonPredicate(
+						col, KuduPredicate::GREATER,
+						KuduValue::FromDecimal(maxv, dec_scale));
+					break;
 				}
 				kpred = table->NewInListPredicate(col, &values);
 				/* NewInListPredicate takes ownership of values */
@@ -1182,7 +1625,13 @@ apply_predicates(KuduTable *table, KuduScanner *scanner,
 						return Status::InvalidArgument("bad comparison op");
 				}
 				KuduValue *kv = NULL;
-				Status st = make_kudu_value(&p, 0, dtype, &kv);
+				Status		st;
+
+				if (is_dec)
+					st = make_decimal_value(&p, 0, dec_precision, dec_scale,
+											cop, &cop, &kv);
+				else
+					st = make_kudu_value(&p, 0, dtype, &kv);
 				if (!st.ok())
 					return st;
 				kpred = table->NewComparisonPredicate(col, cop, kv);

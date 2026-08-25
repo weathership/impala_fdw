@@ -17,6 +17,7 @@
 #include "utils/builtins.h"
 #include "utils/date.h"
 #include "utils/lsyscache.h"
+#include "utils/numeric.h"
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
 
@@ -202,6 +203,45 @@ pack_const(Const *c, const void **ptr_out, int *len_out, Oid *type_out,
 				memcpy(buf, VARDATA_ANY(b), len);
 			*ptr_out = buf;
 			*len_out = len;
+			return true;
+		}
+		case NUMERICOID:
+		{
+			/*
+			 * Kudu DECIMAL is an unscaled integer at a scale fixed by the
+			 * column, which is not visible here -- only exec_kudu.cpp holds
+			 * the Kudu schema. So ship the exact decimal text and let the
+			 * C++ side rescale against the authoritative column scale.
+			 * numeric_out is exact for finite values (no binary round-trip).
+			 *
+			 * Remote quals are NOT rechecked locally (see GetForeignPlan:
+			 * remote_exprs never enter local_exprs), so a rescale that shifts
+			 * a bound by one ulp returns wrong rows rather than slow ones.
+			 * The op-aware rounding that prevents that lives in
+			 * make_decimal_value().
+			 */
+			char	   *s = DatumGetCString(DirectFunctionCall1(numeric_out,
+															   c->constvalue));
+			int			len = strlen(s);
+			char	   *buf;
+
+			/* Kudu DECIMAL has no NaN/Inf; refuse rather than guess a bound. */
+			if (strchr(s, 'N') != NULL || strchr(s, 'n') != NULL ||
+				strchr(s, 'I') != NULL || strchr(s, 'i') != NULL)
+			{
+				if (err)
+					*err = psprintf("numeric %s has no Kudu DECIMAL "
+									"representation", s);
+				pfree(s);
+				return false;
+			}
+
+			buf = (char *) palloc(len + 1);
+			memcpy(buf, s, len + 1);
+			pfree(s);
+			*ptr_out = buf;
+			*len_out = len;
+			*type_out = NUMERICOID;
 			return true;
 		}
 		case TIMESTAMPOID:
