@@ -1517,6 +1517,15 @@ impalaBeginForeignScan(ForeignScanState *node, int eflags)
 	retrieved_attrs = (List *) list_nth(fdw_private, FdwPrivateRetrievedAttrs);
 	remote_exprs = (List *) list_nth(fdw_private, FdwPrivateRemoteExprs);
 
+	/*
+	 * The plan may carry PARAM_EXTERN placeholders; the executor has their
+	 * values by now. Fold them into Consts so the deparser and the Kudu
+	 * predicate builder see only literals. Without this a parameterised qual
+	 * cannot be pushed and the scan degrades to a full fetch filtered locally.
+	 */
+	remote_exprs = impala_resolve_extern_params(remote_exprs,
+											   node->ss.ps.state->es_param_list_info);
+
 	festate->auth = get_option_value(options, OPTION_AUTH);
 	if (festate->auth == NULL)
 		festate->auth = "kerberos";
@@ -1810,9 +1819,11 @@ impalaReScanForeignScan(ForeignScanState *node)
 		ForeignScan *fsplan = (ForeignScan *) node->ss.ps.plan;
 		List	   *remote_exprs;
 
-		/* reopen with same remote_exprs from plan */
+		/* reopen with same remote_exprs from plan; params may have changed */
 		remote_exprs = (List *) list_nth(fsplan->fdw_private,
 										 FdwPrivateRemoteExprs);
+		remote_exprs = impala_resolve_extern_params(
+			remote_exprs, node->ss.ps.state->es_param_list_info);
 		impala_kudu_scan_close(festate->kudu);
 		festate->kudu = NULL;
 		festate->use_kudu = false;

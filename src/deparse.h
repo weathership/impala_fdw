@@ -43,6 +43,12 @@ extern char *impala_build_select_sql(Relation rel,
 									 int64 limit_count);
 
 /* Impala-safe identifier: `name` with backticks doubled. */
+/*
+ * Fold PARAM_EXTERN nodes into the Consts the executor bound. Call from
+ * BeginForeignScan before deparsing or building Kudu predicates.
+ */
+extern List *impala_resolve_extern_params(List *exprs, ParamListInfo pli);
+
 extern void impala_append_ident(StringInfo buf, const char *ident);
 
 /* Deparse a single pushable expr (Const-side only). */

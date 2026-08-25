@@ -6,6 +6,7 @@
 #include "catalog/pg_type.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
+#include "nodes/params.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/restrictinfo.h"
 #include "utils/array.h"
@@ -101,6 +102,25 @@ foreign_expr_walker(Node *node, Index relid)
 	if (IsA(node, Const))
 		return true;
 
+	/*
+	 * External parameters are pushable. The remote SQL and the Kudu predicate
+	 * IR are both built in BeginForeignScan, by which point the executor holds
+	 * the bound values, so impala_resolve_extern_params() can fold these into
+	 * Consts before anything is deparsed.
+	 *
+	 * Without this every parameterised qual was classified local and the scan
+	 * degraded to a full fetch filtered in Postgres. Measured on
+	 * gpu_metrics_tier0, same 66-row window, same connection:
+	 *   literals  0.02s      $1/$2  12.92s
+	 * Every asyncpg / PREPARE / JDBC caller paid that.
+	 *
+	 * PARAM_EXEC is deliberately excluded: those come from correlated
+	 * subplans and nestloop inner scans, and are not reliably bound when the
+	 * scan is opened.
+	 */
+	if (IsA(node, Param))
+		return ((Param *) node)->paramkind == PARAM_EXTERN;
+
 	if (IsA(node, OpExpr))
 	{
 		OpExpr	   *op = (OpExpr *) node;
@@ -170,6 +190,60 @@ foreign_expr_walker(Node *node, Index relid)
 	}
 
 	return false;
+}
+
+/*
+ * Replace PARAM_EXTERN nodes with the Consts the executor has bound.
+ *
+ * Called from BeginForeignScan, before the remote SQL or the Kudu predicate
+ * IR is built, so every downstream deparse path sees only Consts and needs no
+ * param awareness of its own.
+ */
+static Node *
+resolve_extern_params_mutator(Node *node, void *context)
+{
+	ParamListInfo pli = (ParamListInfo) context;
+
+	if (node == NULL)
+		return NULL;
+
+	if (IsA(node, Param))
+	{
+		Param	   *p = (Param *) node;
+		ParamExternData *prm;
+		ParamExternData workspace;
+
+		if (p->paramkind != PARAM_EXTERN || pli == NULL)
+			return node;
+		if (p->paramid < 1 || p->paramid > pli->numParams)
+			return node;
+
+		if (pli->paramFetch != NULL)
+			prm = pli->paramFetch(pli, p->paramid, false, &workspace);
+		else
+			prm = &pli->params[p->paramid - 1];
+
+		if (prm == NULL || !OidIsValid(prm->ptype) || prm->ptype != p->paramtype)
+			return node;
+
+		return (Node *) makeConst(p->paramtype,
+								  p->paramtypmod,
+								  p->paramcollid,
+								  get_typlen(p->paramtype),
+								  prm->isnull ? (Datum) 0 : prm->value,
+								  prm->isnull,
+								  get_typbyval(p->paramtype));
+	}
+
+	return expression_tree_mutator(node, resolve_extern_params_mutator, context);
+}
+
+List *
+impala_resolve_extern_params(List *exprs, ParamListInfo pli)
+{
+	if (exprs == NIL || pli == NULL)
+		return exprs;
+	return (List *) resolve_extern_params_mutator((Node *) exprs, (void *) pli);
 }
 
 bool
