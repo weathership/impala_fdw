@@ -378,8 +378,12 @@ impala_sql_is_range_partition_stmt(const char *sql)
 		return true;
 	if (strncmp(buf, "alter table ", 12) != 0)
 		return false;
+	/* Impala's idempotent forms are the same DDL and the ones a writer that
+	 * provisions ranges ahead of its head actually wants. */
 	return strstr(buf, " drop range partition ") != NULL ||
-		strstr(buf, " add range partition ") != NULL;
+		strstr(buf, " add range partition ") != NULL ||
+		strstr(buf, " drop if exists range partition ") != NULL ||
+		strstr(buf, " add if not exists range partition ") != NULL;
 }
 
 Datum
