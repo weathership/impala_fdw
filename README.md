@@ -12,8 +12,15 @@ join the hot data plane without copying bulk data into Postgres.
 | In scope | Out of scope |
 |----------|-------------------|
 | Kudu hot tables (`kudu_scan` + HS2) | Parquet/ORC/HDFS that is not Iceberg cold |
-| Iceberg cold + UNION views (`impala_sql`) | INSERT over `impala_sql` / Iceberg |
-| `DROP RANGE PARTITION` via `impala_fdw_exec` | Dropping a hash bucket or a partial range slice |
+| Iceberg cold + UNION views (`impala_sql`) | Dropping a hash bucket or a partial range slice |
+| `DROP RANGE PARTITION` via `impala_fdw_exec` | |
+
+**Pending — in-fork, purposeful**: INSERT over `impala_sql` / Iceberg
+(Kudu→Iceberg settle through Impala). Upstream's REST-catalog support is
+read-only "*yet*" (IMPALA-13586); doctrine is that this fork will implement
+the Transparent Hierarchical Storage write path over Kudu and Iceberg
+gradually. Out-of-band settle (HDF5 + `IcebergHdf5Register`) is the bridge,
+not the architecture.
 
 Impala is the **query frontend** (HS2); Kudu is the only **storage backend** we
 need to support for foreign tables.
